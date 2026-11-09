@@ -149,6 +149,38 @@ object NowPlayingUpdate {
     }
 }
 
+/** v14.19：0x5001 专辑封面 —— 只发属性 0x1a 的 U8 传输 ID。
+ *
+ *  v14.17/v14.18 把 JPEG 分包塞进 0x5001 的做法已被 301device-log 证伪：866F 的 5000 订阅集
+ *  里没有 0x0e/0x0f，那些帧按未订阅属性被丢弃（`artifact: title 仍正常`）。
+ *
+ *  iPhone 侧反汇编证据（research/protocol/iap2_input_business_lifecycle）：
+ *   - f_100145e70（封面更新发送路径）：`_iAP2FileTransferCreate` → `_iAP2FileTransferTypeData`
+ *     → `_iap2_sessionFileTransfer_addTransferForFeature` → `_iAP2MsgInit(0x5001)`
+ *     → `_iAP2MsgAddGroupParam(msg,0)` → `_iAP2MsgAddU8Param(msg,group,0x1a,transferId)`。
+ *     即 0x1A 是**单字节**的 file transfer id，本身不带图片数据。
+ *   - 14-nowplaying-dataflow-audit.md：`MediaItemArtwork` 订阅键的唯一触发条件是媒体数组含 0x1a。
+ *   - 04-nowplaying.md A04.6：图片本身走 iAP2 文件传输会话，消息体只放传输 ID/元数据。
+ *   - f_100183b8c：文件传输数据面首字节即 transfer id（`bVar1=*param_2` → findTransferEntry）。
+ *
+ *  所以本版只发第 1 段（0x1a=U8 id），不伪造图片分包；第 2 段（文件传输会话）待车机回话后
+ *  按其真实帧格式实现。属性编号仍可用 `carvex.artwork.attrId` 在实机上换值复测。 */
+object ArtworkTransfer {
+    const val DEFAULT_ATTR_ID=0x1a
+    val ATTR_ID:Int get()=attr(DEFAULT_ATTR_ID,"carvex.artwork.attrId")
+    private fun attr(fallback:Int,name:String):Int{
+        val raw=System.getProperty(name)?.trim()?.removePrefix("0x")?.takeIf{it.isNotEmpty()}?:return fallback
+        return raw.toIntOrNull(16)?.takeIf{it in 0..255}?:fallback
+    }
+    const val FORMAT_JPEG=0
+    /** iAP2 文件传输 id 是 7 位（0-127），见 Apple 论坛对 FileTransferIdentifier 的说明。 */
+    fun transferId(token:Int):Int = token and 0x7f
+    fun idFields(id:Int):List<Pair<Int,ByteArray>>{
+        require(id in 0..127){"artwork transfer id must fit the 7-bit iAP2 file transfer id"}
+        return listOf(ATTR_ID to byteArrayOf(id.toByte()))
+    }
+}
+
 /** One authenticated Link owns the subscription. Backend snapshots may precede Link readiness.
  * All mutations and sends serialize: STOP cancels uncommitted updates, not bytes already sent. */
 class NowPlayingPublisher(private val emit:(List<Pair<Int,ByteArray>>)->Boolean) {
@@ -156,6 +188,8 @@ class NowPlayingPublisher(private val emit:(List<Pair<Int,ByteArray>>)->Boolean)
     private var selection:NowPlayingUpdate.Selection?=null
     private var snapshot=NowPlayingUpdate.Track()
     @Synchronized fun linkReady(ready:Boolean){this.ready=ready;selection=null}
+    /** 订阅是否存在：封面分包只能发给已订阅 5000 的车机。 */
+    @Synchronized fun subscribed():Boolean = ready && selection != null
     @Synchronized fun command(id:Int,fields:IapFields):Boolean {
         if(!ready)return false
         when(id){

@@ -35,7 +35,16 @@ class CompressedAudioEncoder private constructor(
     private val bytesOut=AtomicLong()
     private val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
     // Enter the try/finally before returning from construction; immediate close must still release codec.
-    private val worker=scope.launch(start=CoroutineStart.UNDISPATCHED){runEncoder()}
+    private val worker=scope.launch(start=CoroutineStart.UNDISPATCHED){
+        // CarWith 桥接下 CPU/调度竞争会拖慢编码 worker，导致 input 块过期被丢弃（91 日志丢 ~30%）。
+        // 提升为 URGENT_AUDIO，保证 AAC 编码吞吐 ≥ 实时速率。
+        val tid=android.os.Process.myTid()
+        val previous=android.os.Process.getThreadPriority(tid)
+        try{
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            runEncoder()
+        }finally{android.os.Process.setThreadPriority(previous)}
+    }
 
     /** Nonblocking submission. A missing/slow consumer cannot accumulate unlimited source audio. */
     fun submit(pcm:ByteArray,source:PcmFormat):Boolean {

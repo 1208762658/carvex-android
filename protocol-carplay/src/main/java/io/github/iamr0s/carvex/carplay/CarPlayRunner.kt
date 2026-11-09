@@ -75,6 +75,7 @@ class CarPlayRunner(
 
     suspend fun prepareNetwork(bootstrap:WifiBootstrap,handoff:IapNetworkHandoff,
         join:suspend(WifiBootstrap)->NetworkPath):NetworkHandoffPipeline.Ready<NetworkPath,CarPlayControlPublication> {
+        host.log("prepareNetwork entered (handoff route active); pipeline will touch handoff context")
         val pipeline=NetworkHandoffPipeline(handoff,join,
             publish={path:NetworkPath->
                 resources.own(CarPlayControlPublication(context,path,options,
@@ -97,6 +98,59 @@ class CarPlayRunner(
         return pipeline.open(bootstrap)
     }
 
+    /** 866F 无 Wi-Fi handoff 能力时的直连网络路径（VW-866F quirk）。
+     *  车机不在蓝牙上公告 4301/5703（`wifiAnnouncement=false, carPlayStartSession=false`），
+     *  Wi-Fi 配置由 Identify(1d01) 参数直接给出；此处直接加入车机网络并用 Bonjour
+     *  发现车机端点，不依赖 IapNetworkHandoff（重同步后 handoff 上下文已作废，避免
+     *  `Network handoff context retired` 崩溃）。 */
+    suspend fun prepareNetworkDirect(
+        bootstrap: WifiBootstrap,
+        join: suspend (WifiBootstrap) -> NetworkPath,
+    ): NetworkHandoffPipeline.Ready<NetworkPath, CarPlayControlPublication> {
+        host.log("prepareNetworkDirect entered (no handoff route); direct join + Bonjour, handoff untouched")
+        val joinStartedAt=android.os.SystemClock.elapsedRealtime()
+        val network = run {
+            val joined = join(bootstrap)
+            // v14.22：306 的 DIRECT 分支只有入口一行、没有结果，无法判断是 join 失败还是
+            // Bonjour 没发现。这里把两段都打出来。
+            host.log("DIRECT Wi-Fi join ok in "+(android.os.SystemClock.elapsedRealtime()-joinStartedAt)+"ms"+
+                " iface="+joined.properties.interfaceName+
+                " links="+joined.properties.linkAddresses.joinToString(","))
+            joined
+        }
+        val discoveryStartedAt=android.os.SystemClock.elapsedRealtime()
+        val publication = resources.own(
+            CarPlayControlPublication(context, network, options, { true }, host::log, host::failure)
+        ).also { publication ->
+            bootstrap.endpoint?.addresses.orEmpty().mapNotNull { address ->
+                runCatching { Bootstrap.address(network.properties, address) }.getOrNull()
+            }.let(publication::candidates)
+            publication.start()
+        }
+        val discovery = ReceiverDiscovery(context, network, bootstrap, resources, host::log)
+        return try {
+            discovery.start()
+            val metadata = discovery.await()
+            host.log("DIRECT Bonjour resolved host="+metadata.endpoint?.hostAddress+" port="+metadata.port+
+                " deviceId="+(metadata.deviceId?.take(12))+" elapsedMs="+
+                (android.os.SystemClock.elapsedRealtime()-discoveryStartedAt))
+            val resolved = bootstrap.resolved(
+                requireNotNull(metadata.endpoint?.hostAddress),
+                requireNotNull(metadata.port),
+                requireNotNull(metadata.deviceId),
+                metadata.publicKey,
+                metadata,
+            )
+            NetworkHandoffPipeline.Ready(network, publication, resolved)
+        } catch(t:Exception){
+            host.log("DIRECT Bonjour discovery failed: "+t.javaClass.simpleName+" "+(t.message?:"")+
+                "; handoff context untouched")
+            throw t
+        } finally {
+            resources.release(discovery)
+        }
+    }
+
     /** 构造 AirSession；媒体管线仍由编排层通过返回对象驱动（A 方案）。
      *  `localFps` 与 `sourceContextCurrent` 依赖编排层状态，因此作为参数传入而不是放进 host。 */
     fun openSession(
@@ -106,6 +160,7 @@ class CarPlayRunner(
         localFps: (Int, Int, Int) -> Int?,
         sourceContextCurrent: () -> Boolean,
         controlPublication: CarPlayControlPublication? = null,
+        bluetoothLink: IapLink? = null,
     ): AirSession = AirSession(
         context, path, bootstrap, options, resources,
         host::log,
@@ -122,5 +177,6 @@ class CarPlayRunner(
         security,
         sourceContextCurrent,
         controlPublication = controlPublication,
+        bluetoothLink = bluetoothLink,
     )
 }

@@ -22,10 +22,21 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.*
 
-/** Splash duration before the host takes the encoder surface. */
-private const val SPLASH_MILLIS=6_000L
+/** Splash duration before the host takes the encoder surface.
+ *  VW-866F v14.8 (2026-11-03): 6s splash pushed audio SETUP to CONTROL_READY+5.3s; 866F
+ *  closes RTSP at CONTROL_READY+~7.5s (session-activation timeout), so media audio never
+ *  got its SETUP through (21device-log: cat=3 speech SETUP 200 @+5.4s, cat=2 alert
+ *  SETUP 400 at the timeout instant, cat=1 media never sent). Cut to 1.5s so the audio
+ *  phase starts ~1.5s after the video SETUP completes and every audio channel has time
+ *  before the 7.5s deadline. */
+private const val SPLASH_MILLIS=1_500L
 
 private const val MIN_BITRATE=1_000_000
+
+/** v14.17 (task 1): 866F 在 hostHint=11 Mbps 下会把码率抬到 10.8 Mbps，实测触发接收端
+ *  背压（视频 socket 写阻塞数十秒）。默认把视频码率上限压到 7 Mbps；hostHint 更高时取此值。
+ *  可用系统属性 carvex.bitrate.max 覆盖（调试用），0 表示不设上限。 */
+private fun maxVideoBitrate():Int = System.getProperty("carvex.bitrate.max")?.toIntOrNull() ?: 7_000_000
 
 /** 按像素率估算码率：约 0.13 bit/像素/帧，最低 1 Mbps。
  *  例：1080p30≈8.1 Mbps、720p30≈3.6 Mbps、1080p60≈16.2 Mbps。 */
@@ -96,18 +107,76 @@ class SessionController(
                         TransportErrorCategory.PLATFORM_UNSUPPORTED,TransportErrorCategory.PERMISSION_DENIED,
                         TransportErrorCategory.INTERFACE_BIND_FAILED,
                         TransportErrorCategory.AUTH_FAILED,TransportErrorCategory.IDENTIFICATION_REJECTED)
-                    val terminal=(t is IapStartupTimeout)||terminalTransport||t is PairUnsupported||t is SecurityException||t is IllegalArgumentException||t is IllegalStateException||
+                    // v14.22：SecurityFailure 继承 IllegalArgumentException，旧逻辑把它算 terminal →
+                    // 866F 一次 peer restart 就让整个任务失败停住（306 的 38eddd35 在 stage WIFI
+                    // 后 1.9s 直接死，用户只能去取消配对）。这里把 STALE_CONTEXT 排除出 terminal，
+                    // 交给外层 0.6s 立即重连（配对记录保留）。
+                    // v14.24：现场对照"14.17 能连、v14.22/23 卡在车机 Wi-Fi"。v14.18–v14.23 里
+                    // 唯一动过连接路径的就是这两处"重同步不判死"，它会把 handoff 被 supersede 的
+                    // 会话硬推进 DIRECT 分支。默认关闭，恢复 v14.17 的路径；需要继续试错时设 1。
+                    val retryStaleContext=System.getProperty("carvex.security.retryStaleContext")?.trim()=="1"
+                    val staleSecurity=retryStaleContext&&t is SecurityFailure&&
+                        t.diagnostic.localReason==SecurityReason.STALE_CONTEXT
+                    val terminal=(t is IapStartupTimeout)||terminalTransport||t is PairUnsupported||t is SecurityException||
+                        (t is IllegalArgumentException&&!staleSecurity)||t is IllegalStateException||
                         accessoryRejected||t is DigestRequired
                     if(terminal){
                         BridgeStore.update(id){it.copy(stage=Stage.FAILED,detail="在 "+it.stage.title+" 阶段失败",error=BridgeStore.redact(t.message?:t.javaClass.simpleName))}
                         break
                     }
-                    BridgeStore.update(id){it.copy(stage=Stage.RETRY,detail="资源已释放，等待恢复连接",error=BridgeStore.redact(t.message?:"连接中断"))}
-                    delay(options.retryIntervalSeconds*1000L)
+                    val dirtyReceiver=t is java.io.IOException&&t.message?.contains("read ret: -1")==true
+                    // v14.22：866F 在握手后半程会主动发起 link restart（peer-initiated
+                     // resynchronization），我们的 bindEpoch 守卫会以 STALE_CONTEXT 结束本次
+                     // 尝试。这不是配对失效，不能立刻判死，也不能让用户取消配对：直接 0.6s
+                     // 后用同一份配对重连一次即可。
+                    val staleLink=t.message?.contains("STALE_CONTEXT")==true||t.message?.contains("source-link-restart")==true
+                    BridgeStore.update(id){it.copy(stage=Stage.RETRY,
+                        // v14.16.1: 一次失败后自动重试 2s 通常即可恢复（866F 清理脏状态）；连续两次
+                        // 以上失败才提示用户手动开关蓝牙（Android 13+ 应用无权自动 disable/enable）。
+                        detail=when{
+                            staleLink->"车机重同步打断了握手链路，正在自动重连（保留配对，无需取消配对）"
+                            attempt>=2&&dirtyReceiver->"蓝牙连接被车机连续拒绝（bond/cache 可能已脏）：可以先取消配对再重新配对一次；不取消配对时会继续自动重试"
+                            else->"资源已释放，等待恢复连接"
+                        },
+                        error=BridgeStore.redact(t.message?:"连接中断"))}
+                    // VW-866F keeps refusing new connections for several seconds after it closes the
+                    // RTSP control connection (observed: 8 rapid retries all failed at DETECT / Wi-Fi
+                    // request unavailable / RFCOMM read -1). Back off linearly so the receiver resets.
+                    // v14.17 (task 2): after three consecutive failures stop trusting short
+                    // backoff. 866F keeps its Bluetooth/Wi-Fi stack locked after repeated
+                    // abnormal closes; hammering it every 2-10 s deepens the dirty state. The
+                    // first two attempts keep the fast path (observed: attempt 2 at 2 s
+                    // reconnects in 0.5 s), the third and later wait 30 s.
+                    // v14.21：305 日志里重试间隔从 2s 一路拉到 51s，体感就是"点半天没反应"。
+                    // 前 5 轮压到 5s 内（-1 是立即失败，多试的代价很小），之后仍回落到 30s
+                    // 深度恢复，避免把车机蓝牙栈越撞越脏。carvex.connect.fastBackoff=0 回滚。
+                    val fastBackoff=System.getProperty("carvex.connect.fastBackoff")?.trim()?.let{it!="0"}?:true
+                    val backoffMs=when{
+                        staleLink&&attempt<8->600L
+                        staleLink->30_000L
+                        fastBackoff&&attempt<6-> minOf(5_000L,options.retryIntervalSeconds*1000L*attempt.coerceIn(1,5))
+                        attempt>=3-> 30_000L
+                        else-> options.retryIntervalSeconds*1000L*attempt.coerceIn(1,5)
+                    }
+                    BridgeStore.log(id,"retry backoff ${backoffMs/1000}s (attempt=$attempt, fast="+fastBackoff.toString()+
+                        ", stale="+staleLink.toString()+"); receiver needs time to recover"+
+                        if(attempt>=3) " (deep recovery: repeated RFCOMM failures)" else "")
+                    delay(backoffMs)
                 }
             }
         }
     }
+    /** v14.23：车机热点连不上时用户只看到"卡住"。这里把 SSID 和现场动作写进 UI 与日志，
+     *  并保持异常原样抛出，让既有重试循环照常工作。 */
+    private suspend fun <T> joinWifiOrHint(id:String,c:io.github.iamr0s.carvex.carplay.WifiBootstrap,block:suspend()->T):T =
+        try{ block() }
+        catch(t:Throwable){
+            BridgeStore.log(id,"Wi-Fi join failed before AirPlay session: "+t.javaClass.simpleName+" "+(t.message?:""))
+            BridgeStore.log(id,"Wi-Fi join hint: 手机需连上 "+c.ssid+" 热点（安全类型 "+c.security+
+                "）；请允许系统 WLAN 授权弹窗，并先断开其它已保存 Wi-Fi 再试")
+            BridgeStore.update(id){it.copy(detail="车机 Wi-Fi 连不上：请在系统 WLAN 里连接 \""+c.ssid+"\" 后重试（先断开其它 Wi-Fi，并允许系统弹窗）")}
+            throw t
+        }
     private suspend fun openLocalVideoContent(id:String,surface:Surface,width:Int,height:Int,fps:Int):LocalVideoContent? {
         val factory=localContent?:return null
         return try{factory.open(context,surface,width,height,fps)}
@@ -150,7 +219,14 @@ class SessionController(
                 encodedFps=(encoded.get()-measuredEncoded)/seconds,droppedFrames=dropped.get(),queueMs=queueMs.getAndSet(0),writeMs=writeMs.getAndSet(0),idrRequests=idr.get())}
             measuredAt=now;measuredFrames=f;measuredBytes=b;measuredEncoded=encoded.get()
         },1000,1000,TimeUnit.MILLISECONDS)
-        fun failure(t:Throwable){if(attemptJob.isActive&&!ended.get()&&failed.complete(t)){BridgeStore.log(id,"channel failure "+t.javaClass.simpleName+" "+(t.message?:"no message"));if(false)t.stackTrace.take(4).forEach{BridgeStore.log(id,"${"channel origin "}${it}")};cleanup.close()}}
+        fun failure(t:Throwable){if(attemptJob.isActive&&!ended.get()&&failed.complete(t)){
+            BridgeStore.log(id,"channel failure "+t.javaClass.simpleName+" "+(t.message?:"no message"))
+            // v14.20：display 缺失是唯一需要用户在车机上动手的失败，界面文案必须说清做什么。
+            if(t.message?.contains("receiver-no-display")==true){
+                BridgeStore.log(id,"receiver-no-display：车机未声明显示能力，请在车机上重进 CarPlay 页面或重启车机后重试")
+                BridgeStore.update(id){it.copy(detail="车机未声明显示能力，请重进 CarPlay 页面或重启车机后重试",error="receiver-no-display")}
+            }
+            if(false)t.stackTrace.take(4).forEach{BridgeStore.log(id,"${"channel origin "}${it}")};cleanup.close()}}
         suspend fun <T> phase(stage:Stage,millis:Long,block:suspend()->T):T {
             BridgeStore.update(id){it.copy(stage=stage,detail=stage.title,error=null)}
             BridgeStore.log(id,"stage "+stage.name)
@@ -184,6 +260,8 @@ class SessionController(
         val musicLock=Any()
         val latestMusic=AtomicReference<NowPlayingUpdate.Track?>(null)
         val musicAir=AtomicReference<AirSession?>(null)
+        /** v14.17 (task 4)：上一张已发送封面的 token，避免同一张图反复灌字节。 */
+        val lastArtworkToken=java.util.concurrent.atomic.AtomicInteger(Int.MIN_VALUE)
         fun deliverMusic(replaceMedia:Boolean=true){synchronized(musicLock){
             if(!ended.get())latestMusic.get()?.let{musicAir.get()?.nowPlaying(it,replaceMedia=replaceMedia)}
         }}
@@ -281,8 +359,39 @@ class SessionController(
                             BridgeStore.log(id,"CarLife music Intent send failed: "+it.javaClass.simpleName)
                         }}
                     }else BridgeStore.log(id,"CarLife music Intent had no recognized metadata fields")
-                    if(CarLifeMusicIntent.hasArtwork(intent))
-                        BridgeStore.log(id,"CarLife music artwork observed; 5001 artwork file transfer remains unimplemented")
+                    if(CarLifeMusicIntent.hasArtwork(intent)){
+                        // v14.17 (task 4): 旧行为是"观察到封面就丢"，仪表盘永远空白。现在先跑
+                        // 统一管线（读 byte[]/Bitmap/Uri → 256×256 JPEG 70% → MD5 token），
+                        // 报文层用开关控制：0x5001 的 artwork 属性编号在本仓库文档与往期抓包里
+                        // 都没确认过，默认不发（链路行为与 v14.16 完全一致）；置
+                        // carvex.artwork=1 后才发实验分包，一次实机 A/B 就能判定车机是否接受。
+                        scope.launch(Dispatchers.IO){
+                            val prepared=runCatching{ArtworkPipeline.prepare(context,intent)}.getOrNull()
+                            if(prepared==null){
+                                BridgeStore.log(id,"CarLife music artwork observed but not decodable: Intent carried no byte[], Bitmap or readable Uri")
+                                return@launch
+                            }
+                            BridgeStore.log(id,"artwork prepared token="+prepared.token+" size="+prepared.width+
+                                "x"+prepared.height+" jpegBytes="+prepared.bytes.size+" chunks="+prepared.chunks)
+                            if(System.getProperty("carvex.artwork")=="0"){
+                                BridgeStore.log(id,"artwork wire transfer disabled by carvex.artwork=0 (previous default-off build skipped every frame)")
+                                return@launch
+                            }
+                            val previous=lastArtworkToken.getAndSet(prepared.token)
+                            if(previous==prepared.token){
+                                BridgeStore.log(id,"artwork token unchanged; keeping the transfer already sent for this image")
+                                return@launch
+                            }
+                            val artworkAir=musicAir.get()
+                            if(artworkAir==null){
+                                BridgeStore.log(id,"artwork ready but no AirPlay session carries iAP2 yet; transfer skipped")
+                                return@launch
+                            }
+                            runCatching{artworkAir.artwork(prepared.token,prepared.bytes)}.onFailure{
+                                BridgeStore.log(id,"artwork send failed: "+it.javaClass.simpleName)
+                            }
+                        }
+                    }
                     return
                 }
                 when(action){
@@ -464,10 +573,19 @@ class SessionController(
                 " monoNs="+System.nanoTime()+" speechSetupAvailable="+(startSpeech.get()!=null))
             BridgeStore.recordCarPlayKey(CarPlayEvents.voice(action))
             val raw=action.toIntOrNull()?:return false
+            if(raw==1){
+                // VW-866F v14.15: 866F sends Siri action=1 as a voice-key press notification.
+                // Acknowledge it (200) without toggle state or speech SETUP - a 501 reply is
+                // avoidable and CarWith voice is handled by the host, not a CarPlay channel.
+                BridgeStore.log(id,"CarPlay Siri action=1 acknowledged (press event); no speech SETUP, no toggle")
+                return true
+            }
             if(raw==2){
-                val newSetup=startSpeech.get()?.invoke()
-                BridgeStore.log(id,"Voice speech preparation newSetupRequested="+newSetup+
-                    "; false may mean already prepared or request coalesced")
+                // VW-866F v14.15: never actively SETUP a speech (category 3) stream. 866F
+                // rejects any second active audio channel initiated by the phone (v14.11
+                // alert/speech same pattern: hang ~2s -> 400 -> EOF Truncated 0/2 kills the
+                // whole RTSP session). The voice key still toggles the CarWith host below.
+                BridgeStore.log(id,"Voice speech SETUP suppressed (VW-866F single active audio channel; 400+EOF) speechSetupAvailable="+(startSpeech.get()!=null))
             }
             val accepted=voiceToggle.button(raw){voiceOutput.trySend(null).isSuccess}
             BridgeStore.log(id,"CarPlay Siri action="+raw+" adapterAccepted="+accepted+
@@ -559,7 +677,7 @@ class SessionController(
             override fun warn(message:String){BridgeStore.update(id){s->s.copy(warning=BridgeStore.redact(message))}}
         }
         val runner=CarPlayRunner(context,o,r,carPlayHost)
-            val bt=phase(Stage.BLUETOOTH,90000){runner.openBluetooth()}
+            val bt=r.own(phase(Stage.BLUETOOTH,90000){runner.openBluetooth()})
             val pendingSourceEof=AtomicReference<Throwable?>(null)
             val sourceFailure=AtomicReference<(Throwable)->Unit>({error->
                 if(generateSequence(error){it.cause}.any{it is java.io.EOFException})pendingSourceEof.compareAndSet(null,error)
@@ -597,7 +715,21 @@ class SessionController(
                 failure(SecurityFailure(SecurityDiagnostic("iAP2","source-link-restart",SecurityReason.STALE_CONTEXT)))
             })
             if(!sourceContextCurrent.get())securityFailure(SecurityReason.STALE_CONTEXT,phase="source-link-restart")
-            networkHandoff.acceptBootstrap(bootstrap)
+            val hasHandoffRoute=bootstrap.identification?.capabilities?.networkHandoff?.hasSupportedRoute==true
+            val _netCaps=bootstrap.identification?.capabilities?.networkHandoff
+            BridgeStore.log(id,"VW-866F handoff route gate: hasSupportedRoute="+hasHandoffRoute+
+                " wifiAnnouncement="+(_netCaps?.wifiAnnouncement)+" carPlayStartSession="+(_netCaps?.carPlayStartSession)+
+                " identificationPresent="+(bootstrap.identification!=null)+
+                " generation="+link.generation+" handoffGeneration="+handoffGeneration+
+                " epoch="+link.linkEpoch+" handoffEpoch="+handoffEpoch)
+            if(hasHandoffRoute&&link.generation==handoffGeneration&&link.linkEpoch==handoffEpoch){
+                networkHandoff.acceptBootstrap(bootstrap)
+            }else{
+                // 866F 无 Wi-Fi handoff 能力或重同步后 handoff 上下文已作废（绑定首次协商的
+                // generation/epoch）。Bootstrap 侧同样置空跳过，866F 无 4301/5703 公告，
+                // 跳过 attach 无副作用。
+                BridgeStore.log(id,"Handoff context superseded (no route or resynchronized); skip bootstrap attach (VW-866F)")
+            }
             lastBootstrap=bootstrap
             val handoff=HandoffSupervisor()
             val sourceRef=HandoffSupervisor.ResourceRef(id+"-bt",1,link.linkEpoch)
@@ -626,7 +758,14 @@ class SessionController(
                     if(snapshot.state==HandoffSupervisor.State.HANDOFF_FAILED)failure(error)
                     else {
                         if(!detached)BridgeStore.log(id,"Bluetooth source detached during explicit handoff; target readiness remains independent")
-                        r.release(link);r.release(bt)
+                        // VW-866F requires the Bluetooth link to stay up after the Wi-Fi iAP
+                        // tunnel synchronizes: "Runtime iAP link synchronized; business handoff
+                        // NOT verified; retain Bluetooth" (session 84a2f770). Releasing the
+                        // BluetoothSocket here was followed ~3s later by the receiver closing
+                        // the RTSP control connection (EOFException Truncated 0/2). Keep the
+                        // socket owned by the session (closed at teardown); release only the
+                        // iAP link streams.
+                        r.release(link)
                     }
                 }else failure(error)
             }
@@ -656,8 +795,45 @@ class SessionController(
                 }}}
                 catch(t:Exception){if(isActive&&!ended.get())sourceFailure.get().invoke(t)}
             }
-            val networkReady=runner.prepareNetwork(bootstrap,networkHandoff){configuration->
-                phase(Stage.WIFI,45000){runner.openNetwork(configuration,::failure)}
+            // v13 (2026-11-02): session b1fa1893 实测 - 866F 配对完成后自动重连，identification
+            // generation(3) 与 handoff 上下文绑定 generation(1) 不一致，612 已判 superseded
+            // 跳过 attach；但旧 route 选择只按 hasHandoffRoute 判 PIPELINE → prepareNetwork 触碰
+            // 已 retired 上下文崩 "Network handoff context retired"（配对后连不上的根因之一）。
+            // route 选择必须与上下文有效性一致：context 无效 → DIRECT 直连 + Bonjour，不再触碰 handoff。
+            // v14.22：866F 在握手后半程会连续重同步（306 的 10486f7d：10:21:00.24 epoch=1、
+            // 10:21:03.65 epoch=2，间隔 3.4s）。直接在抖动里进 WIFI，attach 刚建立就会被
+            // bindEpoch 判 STALE_CONTEXT。先确认 link 在 900ms 内没有再变；仍在变就抛
+            // STALE_CONTEXT，交给外层 0.6s 重连（会话不关、配对不丢）。
+            // v14.24：默认跳过这段等待（v14.22 里它会在车机正常抖动时抛 STALE_CONTEXT，
+            // 把会话推去 DIRECT，现场表现为卡在连车机 Wi-Fi）。设 carvex.link.settleBeforeWifi=1 再启用。
+            val settleBeforeWifi=System.getProperty("carvex.link.settleBeforeWifi")?.trim()=="1"
+            if(settleBeforeWifi){
+                val settleGeneration=link.generation
+                val settleEpoch=link.linkEpoch
+                val settleFrom=SystemClock.elapsedRealtime()
+                delay(900)
+                val settleStable=link.generation==settleGeneration&&link.linkEpoch==settleEpoch
+                BridgeStore.log(id,"link settle before stage WIFI: stable="+settleStable.toString()+
+                    " waitedMs="+(SystemClock.elapsedRealtime()-settleFrom)+" generation="+link.generation+
+                    " epoch="+link.linkEpoch+" handoffGeneration="+handoffGeneration+" handoffEpoch="+handoffEpoch)
+                if(!settleStable)securityFailure(SecurityReason.STALE_CONTEXT,phase="settle-before-wifi")
+            }else{
+                BridgeStore.log(id,"link settle skipped (carvex.link.settleBeforeWifi=0); stage WIFI proceeds like v14.17")
+            }
+            val contextValid=hasHandoffRoute&&link.generation==handoffGeneration&&link.linkEpoch==handoffEpoch
+            val networkReady=if(contextValid){
+                BridgeStore.log(id,"VW-866F route chosen: PIPELINE (handoff route active)")
+                runner.prepareNetwork(bootstrap,networkHandoff){configuration->
+                    joinWifiOrHint(id,configuration){phase(Stage.WIFI,45000){runner.openNetwork(configuration,::failure)}}
+                }
+            }else{
+                // 866F quirk：handoff 上下文已作废/未就绪。Wi-Fi 配置由 Identify 参数直接给出，
+                // 走直连 + Bonjour 发现，不触碰已作废的 handoff 上下文。
+                BridgeStore.log(id,"866F quirk: handoff context unavailable (superseded/retired); direct network join + Bonjour discovery")
+                BridgeStore.log(id,"VW-866F route chosen: DIRECT (context superseded)")
+                runner.prepareNetworkDirect(bootstrap){configuration->
+                    joinWifiOrHint(id,configuration){phase(Stage.WIFI,45000){runner.openNetwork(configuration,::failure)}}
+                }
             }
             val network=networkReady.network
             bootstrap=networkReady.bootstrap
@@ -667,7 +843,8 @@ class SessionController(
             val air=runner.openSession(network,bootstrap,sourceBinding,VideoEncoder.supportedFps(),
                 {sourceContextCurrent.get()&&!ended.get()&&!failed.isCompleted&&
                     link.linkEpoch==sourceBinding.epoch&&link.generation==sourceBinding.generation},
-                controlPublication=networkReady.publication)
+                controlPublication=networkReady.publication,
+                bluetoothLink=link)
             activeAir=air
             // Publication precedes this check: disconnect either captures this
             // AirSession, or prevents its preparation after an earlier null snapshot.
@@ -735,10 +912,27 @@ class SessionController(
                 val candidates=listOfNotNull(normalizedHint,nominal)
                 var bitrate=candidates.max()
                 bitrate=videoCeiling?.let{bitrate.coerceAtMost(it)} ?: bitrate
+                // v14.17 (task 1): cap the negotiated bitrate. 866F accepts the SETUP/RECORD with
+                // any value, but then stops consuming the video TCP write path when the rate is
+                // too high (observed 10.8 Mbps -> 46 s socket-write stall). 7 Mbps keeps the
+                // encoder well inside the link budget; the cap is logged so a test can tell
+                // whether it was applied.
+                val cap=maxVideoBitrate()
+                val capped=if(cap>0)bitrate.coerceAtMost(cap) else bitrate
+                if(capped!=bitrate)BridgeStore.log(id,"Video bitrate capped for receiver backpressure: requested="+bitrate+" cap="+cap+" applied="+capped)
+                bitrate=capped
                 bitrate=bitrate.coerceAtLeast(MIN_BITRATE)
                 BridgeStore.log(id,"Video bitrate="+bitrate+" candidates="+candidates+
                     " (hostHint="+hostHint+" normalized="+normalizedHint+" nominal="+nominal+
                     " hintPixels="+hintPixels+" actualPixels="+actualPixels+" codecCeiling="+videoCeiling+")")
+                // v14.17 (task 7)：RECORD 返回后立刻确认"这块屏幕尺寸/帧率有没有可用 AVC 编码器"。
+                // 203 的失败形态是 RECORD 200 → 码率 → 控制通道 EOF，日志里看不到编码器到底能不能
+                // 起来；预检把这一步提前并明确记录，失败时也不进入无意义的等待。
+                val preflightEncoder=runCatching{VideoEncoder.preflight(hostWidth,hostHeight,fps,format)}
+                    .onSuccess{BridgeStore.log(id,"Encoder preflight ok name="+it+" size="+hostWidth+"x"+hostHeight+" fps="+fps)}
+                    .onFailure{BridgeStore.log(id,"Encoder preflight failed: "+it.javaClass.simpleName+" "+it.message+
+                        "; video pipeline cannot start for "+hostWidth+"x"+hostHeight+"@"+fps)}
+                    .getOrThrow()
                 fun makeEncoder(rate:Int)=VideoEncoder(hostWidth,hostHeight,rate,bitrate,format,r,{b,config,pts->air.send(b,config,pts)},{n->
                     val count=frames.incrementAndGet();bytes.addAndGet(n.toLong())
                     if(count==1L&&!ended.get())BridgeStore.update(id){
@@ -766,6 +960,10 @@ class SessionController(
                     "front-surface-draw-failed"->BridgeStore.log(id,"drawing into the encoder front surface failed; stopped repeating the log")
                     else->VideoDiagnosticLog.message(name,value)?.let{BridgeStore.log(id,it)}
                 }},stopSend={air.closeVideo()},
+                    // v14.20：第一次 6 s 写阻塞走通道重建（screen SETUP + RECORD，保留 control/audio），
+                    // 第二次才结束会话。carvex.video.stallRecovery=0 回滚到 v14.19 的直接打断。
+                    stallRecovery=if(System.getProperty("carvex.video.stallRecovery")?.trim()!="0")
+                        ({air.recoverVideoTransport()}) else null,
                     // Opt-in latency trade: the front surface is the only way a still CarWith picture
                     // gets a P frame, and it costs a blit per frame plus a few frames of latency.
                     frontSurface=o.frontSurface&&fromHost)

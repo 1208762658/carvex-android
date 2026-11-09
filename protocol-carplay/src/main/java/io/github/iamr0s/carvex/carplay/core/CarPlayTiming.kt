@@ -50,12 +50,14 @@ object CarPlayTiming {
     }
 }
 
-/** SIRI_EVENT_COMMAND_V1: only the integer branches 2/3 have a confirmed adapter mapping. */
+/** SIRI_EVENT_COMMAND_V1: integer branches 1/2/3 are accepted (1=press event, 2=toggle,
+ * 3=rearm). VW-866F sends action=1 as a voice-key press notification (v14.15: it was
+ * answered 501 before, and a 501 on the event command is not fatal but is avoidable). */
 object SiriCommand {
     fun action(command:Map<String,Any?>):Int? {
         if(command["type"]!="requestSiri")return null
         val raw=(command["params"] as? Map<*,*>)?.get("siriAction")
         val value=when(raw){is Int->raw.toLong();is Long->raw;else->return null}
-        return value.takeIf{it==2L||it==3L}?.toInt()
+        return value.takeIf{it==1L||it==2L||it==3L}?.toInt()
     }
 }

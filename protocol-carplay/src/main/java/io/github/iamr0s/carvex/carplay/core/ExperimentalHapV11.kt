@@ -9,7 +9,10 @@ object PairingIdentityBinding {
     fun identifier(deviceId:String?,bonjourDeviceId:String?,pairingId:String?):ByteArray {
         lastDeviceIdConflict=deviceId!=null&&bonjourDeviceId!=null&&
             ReceiverIdentity.canonical(deviceId)!=ReceiverIdentity.canonical(bonjourDeviceId)
-        return pairingId?.toByteArray(Charsets.UTF_8)?.takeIf{it.size in 1..1024}
+        // VW-866F quirk: CarPlay endpoints advertise no Bonjour pi (pairing id); the 4301
+        // receiver id / Bonjour deviceid is the stable peer identity for the HAP attempt.
+        val base=pairingId?.takeIf{it.isNotBlank()} ?: deviceId ?: bonjourDeviceId ?: "carplay"
+        return base.toByteArray(Charsets.UTF_8).takeIf{it.size in 1..1024}
             ?:securityFailure(SecurityReason.PAIR_IDENTIFIER_MISSING)
     }
     fun requirePeer(identifier:ByteArray,advertised:ByteArray?,peer:PeerIdentity) {

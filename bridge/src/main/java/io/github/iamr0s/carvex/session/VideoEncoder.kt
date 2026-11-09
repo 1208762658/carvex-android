@@ -18,6 +18,10 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
     private val resources:Resources,private val send:(ByteArray,Boolean,Long?)->Unit,private val metric:(Int)->Unit,
     private val failure:(Throwable)->Unit,private val diagnostic:(String,Long)->Unit={_,_->},
     private val stopSend:()->Unit={},
+    /** v14.20：一次写阻塞（6 s）不再直接拆整链。回调负责重建视频通道（screen SETUP + RECORD），
+     *  返回 true 表示新通道已可用；null 时保持 v14.19 的行为（直接打断 socket + 结束会话）。
+     *  只在第一次 stall 调用；重建后再次阻塞才结束会话（两级恢复）。 */
+    private val stallRecovery:(()->Boolean)?=null,
     /** Builds the GPU front surface. It is the only way a still picture gets back into the encoder
      *  when the source is not ours to repaint, but it costs a full-screen blit per frame and adds
      *  three to four frames of latency, so it is opt-in and off by default. */
@@ -67,6 +71,13 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
             if(ranges.isEmpty())return null
             return maxOf(1,ranges.minOf{it.lower})..ranges.maxOf{it.upper}
         }
+        /** v14.17 (task 7)：编码器可用性预检。RECORD 200 之后、真正编码之前先明确报出
+         *  "目标尺寸/帧率有没有可用 AVC 编码器"，避免 203 那种"RECORD 成功 → 控制通道 EOF"
+         *  场景里连"管线是否起得来"都看不出来。失败抛出的异常与真实构造一致。 */
+        fun preflight(width:Int,height:Int,fps:Int,hostFormat:Bundle?=null):String {
+            val codec=createCompatibleCodec(width,height,fps,hostFormat)
+            return try{codec.name}finally{runCatching{codec.release()}}
+        }
         private fun createCompatibleCodec(width:Int,height:Int,fps:Int,hostFormat:Bundle?):MediaCodec {
             val errors=mutableListOf<Exception>()
             for(candidate in candidates(hostFormat)){
@@ -93,6 +104,9 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
     val encoderName:String get()=codec.name
     val hardwareAccelerated:Boolean get()=codec.codecInfo.isHardwareAccelerated
     @Volatile private var bitrateSupported=true
+    /** v14.20 stall 恢复状态：写线程看到 recovering 就等待新通道，而不是把这个 packet 判死。 */
+    @Volatile private var stallRecovering=false
+    @Volatile private var stallRecoveryUsed=false
     private var producer:Job?=null
     private var consumer:Job?=null
     private val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
@@ -177,16 +191,48 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
             timer.scheduleAtFixedRate({
                 val now=System.nanoTime()
                 val age=writeDeadline.ageNanos(now)
-                if(!closed.get()&&age!=null&&age>8_000_000_000L){
+                // v14.17 (task 1): a single blocked socket write must not hold the media/keepalive
+                // path for the 46 s observed against 866F. Report a stall at 3 s, then break the
+                // write at 6 s by closing the socket (send then fails fast and the session is
+                // rebuilt). 3 s is far above any healthy write (healthy sessions stay under
+                // ~500 ms), so this cannot false-kill a working link.
+                if(!closed.get()&&age!=null&&age>3_000_000_000L){
                     // A blocked write alone does not distinguish a slow receiver from a failed
                     // link. Report it while independent control/audio workers continue running.
                     if(stallStarted==0L){
                         stallStarted=now
                         diagnostic(VideoDiagnosticLog.WRITE_STALLED_MS,age/1_000_000L)
                     }
-                    if(now-stallStarted>60_000_000_000L){
-                        reportFailure(java.net.SocketTimeoutException("Video socket write stalled for 60 seconds"))
-                        runCatching{stopSend()}
+                    if(now-stallStarted>6_000_000_000L){
+                        val recovery=stallRecovery
+                        if(recovery!=null&&!stallRecoveryUsed){
+                            // v14.20 一级恢复：重建视频通道（screen SETUP + RECORD），保留 control/audio；
+                            // 同时把目标码率降到一半并要一个 IDR，避免新通道一上来又被同一波 backpressure 堵死。
+                            stallRecoveryUsed=true;stallRecovering=true
+                            diagnostic("stall-recovery-start",age/1_000_000L)
+                            val ok=runCatching{recovery()}.getOrDefault(false)
+                            stallRecovering=false
+                            if(ok){
+                                stallStarted=0L
+                                diagnostic("stall-recovery-ok",1)
+                                val target=maxOf(1,initialBitrate/2)
+                                if(bitrateSupported){
+                                    pendingBitrate.set(target)
+                                    diagnostic("bitrate-reduced",target.toLong())
+                                }
+                                requestIdr()
+                            }else{
+                                diagnostic("stall-recovery-failed",1)
+                                reportFailure(java.net.SocketTimeoutException(
+                                    "Video socket write stalled for 6 seconds; video channel rebuild failed"))
+                                runCatching{stopSend()}
+                            }
+                        }else{
+                            // 二级：重建后仍阻塞（或未配置恢复），才结束会话。
+                            reportFailure(java.net.SocketTimeoutException(
+                                "Video socket write stalled for 6 seconds; breaking the socket to release the send path"))
+                            runCatching{stopSend()}
+                        }
                     }
                 }else stallStarted=0L
             },500,500,TimeUnit.MILLISECONDS)
@@ -216,10 +262,27 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
                     if(delivery.decide(packet.config,packet.key,age)!=VideoDeliveryGate.Decision.SEND){diagnostic("dropped",1);continue}
                     // Keep the complete reference chain, including the animation's final frame.
                     // Bounded backpressure applies upstream instead of abandoning pending pictures.
-                    val started=System.nanoTime()
-                    val ticket=writeDeadline.begin(started)
-                    try{send(packet.bytes,packet.config,packet.ptsMonoUs)}finally{writeDeadline.complete(ticket)}
-                    val writeMs=(System.nanoTime()-started)/1_000_000
+                    var attempts=0
+                    var writeMs=0L
+                    while(true){
+                        val started=System.nanoTime()
+                        val ticket=writeDeadline.begin(started)
+                        try{
+                            send(packet.bytes,packet.config,packet.ptsMonoUs)
+                            writeMs=(System.nanoTime()-started)/1_000_000
+                            break
+                        }catch(t:Exception){
+                            // v14.20：通道重建时旧 socket 会被本地关闭，这次写失败并不代表链路坏了。
+                            // 等重建结束后把同一个 packet 发到新通道；只有重建后还失败才交给上层判死。
+                            if(stallRecoveryUsed&&!closed.get()&&attempts<5){
+                                attempts++
+                                diagnostic("stall-retry",attempts.toLong())
+                                while(stallRecovering&&!closed.get())delay(50)
+                                if(!closed.get())continue
+                            }
+                            throw t
+                        }finally{writeDeadline.complete(ticket)}
+                    }
                     diagnostic("write-ms",writeMs)
                     if(!packet.config){
                         metric(packet.bytes.size)

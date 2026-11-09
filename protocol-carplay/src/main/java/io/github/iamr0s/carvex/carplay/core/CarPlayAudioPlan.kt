@@ -133,11 +133,28 @@ object CarPlayAudioPlan {
     }
     fun duplexSupported(entries:List<AudioCapabilities.Entry>,route:Route,format:Format):Boolean =
         route.type==100&&format in playbackFormats(entries,route)&&format in advertised(entries,route,capture=true)
-    /** Existing local prewarm policy (3,2,1), retained for this field/format repair.
-     * It is not a firmware guarantee of stream ordering or same-type concurrency. */
+    /** VW-866F v14.8 (2026-11-03): media FIRST. 21device-log showed 866F pushing the query
+     *  batch and then going silent; our old prewarm order (3,2,1) built speech then alert,
+     *  and alert's SETUP only got its 400 at the CONTROL_READY+7.5s timeout instant, so
+     *  media (866F's main channel, streamType=102/media) never had its SETUP sent before
+     *  the receiver closed RTSP. Real-iPhone order builds main audio first.
+     *  VW-866F v14.10 (2026-11-03): drop ACTIVE alert SETUP. H39/6095 appconnectd refuses
+     *  phone-initiated category=2 alert: it holds the SETUP unresolved and rejects it with
+     *  400 at the session-activation timeout instant, together with the RTSP socket close
+     *  (alert 400 and EOF are the SAME millisecond in 21device-log). iPhone carkitd never
+     *  opens alert on its own - the car requests it via iAP2 and only then the phone builds
+     *  the channel. So bootstrap builds media (1) and speech (3) only; alert (2) is left
+     *  for a future car-request listener.
+     *  VW-866F v14.11 (2026-11-03): media ONLY. 25device-log showed media SETUP 200 (first
+     *  time ever; AAC RTP flowed) and the EOF window collapsing from CONTROL_READY+7.5s to
+     *  +2.97s - and the SECOND active audio SETUP (speech, cseq=48) held 2.011s then got its
+     *  400 in the SAME millisecond as the RTSP close, exactly like alert did in v14.6. So
+     *  H39/6095 accepts exactly ONE phone-initiated audio channel (media); speech/alert must
+     *  be demand-driven (Siri activation / car request). v14.11 builds media alone to test
+     *  whether that completes session activation. */
     fun bootstrapPlayback(entries:List<AudioCapabilities.Entry>,source:PcmFormat,
         supportsEncoded:(Format)->Boolean):List<Selection> =
-        listOf(3,2,1).mapNotNull{category->
+        listOf(1).mapNotNull{category->
             selectPlayback(entries,category,source,requireDuplex=category==3,supportsEncoded=supportsEncoded)
         }.distinctBy{it.route.type to it.route.purpose}
     /** 麦克风（车机采集方向）的候选序。

@@ -115,14 +115,109 @@ object Bootstrap {
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:return emptyList()
         return adapter.bondedDevices.map{Device(it.name?:"未命名设备",it.address)}.sortedBy{it.name}
     }
+    /** v14.22：full SDP 结果的有效期。866F 重同步期间服务记录会消失，超过这个时间就重查。 */
+    private const val SDP_TTL_MS=180_000L
+    /** v14.22：iAP 前连续失败多少次就判定 bond/cache 已经脏了（306：单轮 -1 之后继续 -1）。 */
+    private const val PRE_IAP_FAILURE_THRESHOLD=3
+    private object SdpCache {
+        @Volatile private var uuids:List<String>?=null
+        @Volatile private var at=0L
+        fun store(value:List<String>) { uuids=value; at=android.os.SystemClock.elapsedRealtime() }
+        fun snapshot():List<String>? = uuids
+        fun ageMs():Long = if(at==0L) -1L else android.os.SystemClock.elapsedRealtime()-at
+        fun clear() { uuids=null; at=0L }
+    }
+    private object PreIapFailures {
+        @Volatile private var count=0
+        fun bump():Int { count+=1; return count }
+        fun clear() { count=0 }
+        fun current():Int = count
+    }
+    /** v14.22：等 ACTION_UUID 广播确认的 full SDP 查询。null 表示查询没完成（超时/被拒）。 */
+    @SuppressLint("MissingPermission")
+    private suspend fun refreshSdp(context:Context,device:BluetoothDevice,log:(String)->Unit):List<String>? =
+        withTimeoutOrNull(1_500){
+            suspendCancellableCoroutine{cont->
+                val filter=android.content.IntentFilter(BluetoothDevice.ACTION_UUID)
+                val receiver=object:android.content.BroadcastReceiver(){
+                    override fun onReceive(c:Context,intent:android.content.Intent) {
+                        val reported=intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
+                        if(reported?.address!=device.address)return
+                        runCatching{context.unregisterReceiver(this)}
+                        if(cont.isActive)cont.resume(device.uuids?.map{it.uuid.toString()}.orEmpty())
+                    }
+                }
+                val registered=runCatching{
+                    if(android.os.Build.VERSION.SDK_INT>=33)
+                        context.registerReceiver(receiver,filter,Context.RECEIVER_NOT_EXPORTED)
+                    else context.registerReceiver(receiver,filter)
+                }.isSuccess
+                if(!registered){
+                    log("RFCOMM SDP receiver registration failed; using platform cache")
+                    if(cont.isActive)cont.resume(null)
+                    return@suspendCancellableCoroutine
+                }
+                cont.invokeOnCancellation{runCatching{context.unregisterReceiver(receiver)}}
+                val triggered=try{device.fetchUuidsWithSdp()}catch(t:Exception){
+                    log("RFCOMM SDP fetch rejected: "+(t.message?:t.javaClass.simpleName))
+                    false
+                }
+                if(!triggered){
+                    runCatching{context.unregisterReceiver(receiver)}
+                    if(cont.isActive)cont.resume(null)
+                }
+            }
+        }
     @SuppressLint("MissingPermission")
     suspend fun bluetooth(context:Context,o:Options,r:Resources,log:(String)->Unit):BluetoothSocket {
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:error("Bluetooth unavailable")
         check(adapter.isEnabled){"请先开启蓝牙"}
         require(BluetoothAdapter.checkBluetoothAddress(o.target)){"请选择已配对车机"}
-        val device=adapter.bondedDevices.singleOrNull{it.address==o.target}?:error("目标车机尚未配对")
+        // v14.12 (2026-11-03)：CarWith（小米车联）打开会重启 CarVeX 进程并破坏 866F 蓝牙
+        // bond（90device-log：ad427b55 蓝牙 RFCOMM read -1，用户反馈需重新配对）。目标不在
+        // 已配对列表时自动发起 re-bond（Android 12+ 会弹系统配对确认，用户点确认即可，
+        // 免去手动删配/重配），等待 BOND_BONDED 后再继续 iAP 建立。
+        val device=adapter.bondedDevices.singleOrNull{it.address==o.target}
+            ?: run {
+                log("Bluetooth target not bonded; auto re-bond requested for "+o.target+" (VW-866F CarWith bond loss)")
+                val remote=adapter.getRemoteDevice(o.target)
+                val started=runCatching{remote.createBond()}.getOrDefault(false)
+                // IOException（非 terminal）：外层会按退避重试整个 attempt，每次重试再发起
+                // createBond——用户稍后点系统配对确认即可完成，无需手动删配/重配。
+                if(!started)throw java.io.IOException("目标车机尚未配对（自动重新配对未能发起："+o.target+"）")
+                var waitedMs=0
+                while(waitedMs<15_000){
+                    if(remote.bondState==BluetoothDevice.BOND_BONDED)break
+                    kotlinx.coroutines.delay(500);waitedMs+=500
+                }
+                if(remote.bondState!=BluetoothDevice.BOND_BONDED)
+                    throw java.io.IOException("目标车机自动重新配对超时（"+o.target+"）；将在下一次重试再次发起")
+                log("Bluetooth auto re-bond complete for "+o.target)
+                remote
+            }
         fun trace(direction:String,transaction:String,outcome:String,detail:String?=null)=
             log(ProtocolTrace.event("BLUETOOTH","RFCOMM",direction,transaction,outcome,detail))
+        // v14.22：full SDP。v14.21 只 fetchUuidsWithSdp() 后固定等 700ms 再读 device.uuids，
+        // 306 里拿回来的仍是 5 条标准 UUID（110b/110e/111e…），等于没刷。改为等
+        // ACTION_UUID 广播确认查询完成，并给结果加 TTL，避免每轮都重查拖慢握手。
+        val sdpRefresh=System.getProperty("carvex.rfcomm.sdpRefresh")?.trim()?.let{it!="0"}?:true
+        val cachedUuids=SdpCache.snapshot()
+        val cacheAge=SdpCache.ageMs()
+        if(!cachedUuids.isNullOrEmpty()&&cacheAge in 0..SDP_TTL_MS){
+            log("RFCOMM SDP cache fresh ageMs="+cacheAge+" boundUuids="+cachedUuids.size+
+                " ["+cachedUuids.joinToString(",")+"]")
+        }else if(sdpRefresh){
+            val uuids=refreshSdp(context,device,log)
+            if(uuids!=null){
+                SdpCache.store(uuids)
+                log("RFCOMM SDP full refresh ok boundUuids="+uuids.size+
+                    (if(uuids.isEmpty())" none; outbound probe is speculative" else " ["+uuids.joinToString(",")+"]"))
+            }else{
+                log("RFCOMM SDP full refresh timed out; falling back to platform cache (freshness=unverified)")
+            }
+        }else{
+            log("RFCOMM SDP refresh disabled (carvex.rfcomm.sdpRefresh=0); using platform cache")
+        }
         val bonded=device.bondState==BluetoothDevice.BOND_BONDED
         val servicePlan=WiapBluetoothPolicy.plan(device.uuids?.map{it.uuid},o.listen)
         log("Bluetooth target paired="+bonded+" uuidSource=platform_cache observation="+servicePlan.observation+
@@ -132,14 +227,29 @@ object Bootstrap {
             // 公共 SDK 的两个 listener 仍是独立 channel，也不能自定义 SDP profile 属性。
             log("RFCOMM localRole=PHONE_WIAP sdpTopology=independent_channels "+
                 "customProfileDescriptor=unavailable preAcceptAdmission=unavailable")
-            val listeners=WiapBluetoothPolicy.openPhoneListeners{service->
-                try{
-                    r.own(adapter.listenUsingRfcommWithServiceRecord(service.serviceName,service.localUuid))
-                }catch(t:java.io.IOException){
-                    if(o.listen&&service==WiapBluetoothPolicy.Service.LEGACY)throw t
-                    log("Inbound RFCOMM "+service.inboundLabel+" registration unavailable: "+(t.message?:""));null
-                }
-            }.map{it.service.inboundLabel to it.socket}
+            // 866F 适配：常驻 WiAP Source 发布（:app 的 WiapSourcePublisher）在线时，
+            // 会话内不再重复注册同名 UUID 的 listener —— Android 公共 API 会为同 UUID
+            // 创建两条独立 SDP 记录/两个 SCN，车机搜索可能命中错误通道。出站探测照旧，
+            // 常驻记录由 :app 进程生命周期持有，车机链路建立后的发现窗口即可命中。
+            // listen 模式（只做被连接方）保留自建 listener 以 accept 车机连入。
+            val persistentPublished = !o.listen && BluetoothRoleGate.sourcePublished()
+            // v14.21 试错开关：常驻 publication 与自建 listener 会形成同名 UUID 的两条 SDP 记录，
+            // 车机可能命中错误 SCN，所以默认仍跳过入站监听。需要验证"车机更愿意主动连"时，
+            // 设 carvex.rfcomm.inboundWhilePublished=1 让两路赛跑。
+            val inboundWhilePublished = System.getProperty("carvex.rfcomm.inboundWhilePublished")?.trim()=="1"
+            if (persistentPublished && !inboundWhilePublished) {
+                log("Persistent WiAP source publication active; session inbound listener skipped (outbound probe only;"+
+                    " carvex.rfcomm.inboundWhilePublished=1 also listens)")
+            }
+            val listeners = if (persistentPublished && !inboundWhilePublished) emptyList()
+                else WiapBluetoothPolicy.openPhoneListeners{service->
+                    try{
+                        r.own(adapter.listenUsingRfcommWithServiceRecord(service.serviceName,service.localUuid))
+                    }catch(t:java.io.IOException){
+                        if(o.listen&&service==WiapBluetoothPolicy.Service.LEGACY)throw t
+                        log("Inbound RFCOMM "+service.inboundLabel+" registration unavailable: "+(t.message?:""));null
+                    }
+                }.map{it.service.inboundLabel to it.socket}
             val outboundCandidates=servicePlan.outbound
             // UUID 列表没有 attribute4/channel 结果，不能套用苹果的精确 fallback 条件。
             // 候选只串行探测一次；保持既有超时与选中 socket 机制，方向仲裁另批处理。
@@ -176,6 +286,20 @@ object Bootstrap {
                 trace(direction,"RFCOMM","selected","peer_matched")
             }
             val workers=mutableListOf<Job>()
+            // 866F 原生路径：车机主动连入的预取 socket（常驻发布器 accept 缓存）。
+            // 存在且有效时直接作为 winner，跳过出站探测——车机已经连过来了，
+            // 出站反向连接反而可能造成双链路/干扰。旧连接（已断开）则丢弃回退出站。
+            val pendingInbound = BluetoothRoleGate.takePendingInbound?.invoke()
+            if (pendingInbound != null) {
+                if (pendingInbound.isConnected) {
+                    r.own(pendingInbound)
+                    log("RFCOMM persistent-inbound socket available (initiator=car); skipping outbound probe")
+                    select(pendingInbound, "inbound-persistent")
+                } else {
+                    runCatching { pendingInbound.close() }
+                    log("RFCOMM persistent-inbound socket stale; falling back to outbound probe")
+                }
+            }
             try{
                 if(listeners.isNotEmpty()){
                     log("RFCOMM local listener API calls succeeded="+listeners.map{it.first}+
@@ -201,12 +325,15 @@ object Bootstrap {
                 }
                 if(outboundCandidates.isNotEmpty()){
                     log("RFCOMM outbound attempt order="+outboundCandidates.map{it.service.outboundLabel}+
-                        "; simultaneous listener="+listeners.isNotEmpty())
+                        "; simultaneous listener="+listeners.isNotEmpty()+" (inboundWhilePublished="+inboundWhilePublished+")")
                     workers+=launch(Dispatchers.IO){
                         var last:Exception?=null
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch
                             val direction=candidate.service.outboundLabel
+                            if(direction=="phone-v2"&&last!=null)
+                                log("RFCOMM phone-v2 attempted after "+(last?.javaClass?.simpleName?:"previous candidate")+
+                                    " failed; no outbound candidate abandoned")
                             val uuid=candidate.service.remoteUuid
                             val socket=try{
                                 device.createRfcommSocketToServiceRecord(uuid)
@@ -216,14 +343,21 @@ object Bootstrap {
                                 continue
                             }
                             r.own(socket);activeOutbound.set(socket)
-                            log("RFCOMM outbound $direction connect deadline=20s basis="+candidate.basis+
+                            log("RFCOMM outbound $direction connect deadline=5s basis="+candidate.basis+
                                 " policy=sdk_uuid_hint_probe")
                             trace("tx",direction,"attempt",candidate.basis.name)
-                            val deadlineJob=launch{delay(20_000);if(winnerSocket.get()!==socket)runCatching{socket.close()}}
+                            // v14.16.1 (2026-11-04): Android BluetoothSocket.connect() has no timeout
+                            // API and the 866F in a dirty state ignores the connect until the platform
+                            // stack gives up (~12.5s observed). A 5s deadline closes the socket to
+                            // interrupt that wait; if close cannot wake the native connect promptly the
+                            // connect still returns (socket closed) shortly after. Normal connects
+                            // complete in 0.5-3s, so 5s does not false-kill them.
+                            val deadlineJob=launch{delay(5_000);if(winnerSocket.get()!==socket)runCatching{socket.close()}}
                             try{
                                 socket.connect()
                                 deadlineJob.cancel()
                                 if(!isActive||stopping.get()){r.release(socket);return@launch}
+                                PreIapFailures.clear()
                                 select(socket,direction);return@launch
                             }catch(t:Exception){
                                 last=t
@@ -233,6 +367,36 @@ object Bootstrap {
                                 if(t is CancellationException||t is SecurityException)throw t
                                 if(isActive&&!stopping.get())log("RFCOMM $direction failed before iAP: "+t.javaClass.simpleName+
                                     " "+(t.message?:"")+"; SDP record absence not established")
+                                // v14.16.1 (2026-11-04): a "read ret: -1" (peer closed/ignored the
+                                // connection, 866F dirty state) means every other UUID probe on the
+                                // same accessory will fail the same way (observed repeatedly: phone
+                                // 12.5s then phone-v2 5.1s, both -1). Skip the remaining candidates
+                                // and let the outer retry backoff (2s) recover — the retry's first
+                                // attempt succeeds once the receiver has cleaned up. Non-dirty
+                                // failures (e.g. SDP absence) still try the next candidate.
+                                if(t is java.io.IOException&&t.message?.contains("read ret: -1")==true&&
+                                   (t.message?.contains("timeout")==true||t.message?.contains("closed")==true)){
+                                    // v14.22：只跳过当前 candidate，不再放弃整轮。306 证明一次 -1 之后
+                                    // phone-v2 根本没被尝试，而它是唯一可能绕过 platform_cache 错 UUID
+                                    // 的通道（-1 是约 300ms 的立即拒绝，多试一次代价很小）。
+                                    val tryAll=System.getProperty("carvex.rfcomm.tryAllCandidates")?.trim()?.let{it!="0"}?:true
+                                    val consecutive=PreIapFailures.bump()
+                                    if(tryAll){
+                                        log("RFCOMM dirty-receiver marker (read ret: -1); skipping $direction only;"+
+                                            " remaining outbound candidates still attempted"+
+                                            " (carvex.rfcomm.tryAllCandidates=1, consecutive=$consecutive)")
+                                    }else{
+                                        log("RFCOMM dirty-receiver marker (read ret: -1); skipping remaining outbound candidates;"+
+                                            " relying on outer retry backoff (carvex.rfcomm.tryAllCandidates=0)")
+                                        break
+                                    }
+                                    if(consecutive>=PRE_IAP_FAILURE_THRESHOLD){
+                                        SdpCache.clear()
+                                        log("RFCOMM bond/cache stale suspected: $consecutive consecutive pre-iAP failures;"+
+                                            " SDP cache dropped, full refresh will run next round, re-pair recommended")
+                                    }
+                                    continue
+                                }
                             }
                         }
                         activeOutbound.set(null)
@@ -288,23 +452,24 @@ object Bootstrap {
                   onWifiAnnouncement:WifiAnnouncementHandler?=null,
                   identificationWaitMs:Long=10_000L,
                   networkHandoff:IapNetworkHandoff?=null):ControlResult {
+        // networkHandoff 绑定首次协商的 link.generation/epoch；866F 重同步后该绑定失效。
+        // 重同步重置（checkGeneration）时置 null，后续 configuration()/announcement()/
+        // startRequest() 全部 safe-call 跳过，避免触碰已作废的 handoff 上下文（866F
+        // 无 Wi-Fi handoff 能力，置空无业务副作用）。
+        var networkHandoff = networkHandoff
         require(handoffWaitMs in 1..30_000L)
         // Existing local budget, not an inferred Apple timeout. Tests may only shorten it.
         require(identificationWaitMs in 1..10_000L)
         // Explicit experimental mode checks the current challenge signature without claiming
         // production chain trust. Missing production material belongs to AA, not transport.
-        val generation=link.generation
-        val linkEpoch=link.linkEpoch
-        val control=requireNotNull(link.negotiatedControlSession)
-        fun checkGeneration(){
-            check(link.generation==generation&&link.linkEpoch==linkEpoch&&link.negotiatedControlSession!=null){"iAP link changed during bootstrap"}
-        }
-        checkGeneration()
+        var generation=link.generation
+        var linkEpoch=link.linkEpoch
+        var control=requireNotNull(link.negotiatedControlSession)
         val schema=requireNotNull(IapStartupPolicy.selectSchema(IapControlSessionKind.CARPLAY,control.version)){
             "Unsupported control session version "+control.version}
         if(!experimentalIntegrityOnly)SecurityRequirements.requireAaTrust()
         val order=IapStartupPolicy.candidateStart(IapControlSessionKind.CARPLAY,control.version)
-        val transactions=PeerNegotiationController(if(order==IapStartupPolicy.Order.AUTH_FIRST)
+        var transactions=PeerNegotiationController(if(order==IapStartupPolicy.Order.AUTH_FIRST)
             FallbackAttempt.AUTH_FIRST else FallbackAttempt.IDENT_FIRST,
             control.id,control.version,IapControlSessionKind.CARPLAY)
         val deadline=System.nanoTime()+HANDSHAKE_DEADLINE_MS*1_000_000
@@ -332,6 +497,54 @@ object Bootstrap {
         var cert:java.security.cert.X509Certificate?=null
         var authenticationSchema:AccessoryAuth.ChallengeSchema?=null
         var challenge:ByteArray?=null
+        // VW-866F quirk：车机在 identification accepted 之后主动以新 SYN 重启 iAP 链路。
+        // IapLink 已在链路层完成重同步（reader 线程 exchangeSynchronization(true)，重建控制会话、
+        // 清除链路级认证状态 "authentication-and-readiness cleared"）。本地协商状态跟随重启
+        // 而不是抛异常：检测到 generation/epoch/控制会话变化后，重置认证/识别/握手进度，让新 epoch
+        // 完整重跑一遍。注意 generation 每次 SYN 同步完成都会 ++（IapLink），重同步同样推进它；
+        // 同一 IapLink 实例内 generation 变化只可能来自重同步（真 socket 换代会重建会话与新
+        // IapLink 实例），因此这里不再把 generation 变化当异常抛。
+        var restartRequested=false
+        fun checkGeneration(){
+            if(link.generation==generation&&link.linkEpoch==linkEpoch&&link.negotiatedControlSession===control)return
+            // 重同步进行中，控制会话尚未重建（新 SYN 还没完成）：等下一轮 poll 再检查。
+            val current=link.negotiatedControlSession
+            if(current==null)return
+            log("Detect peer-initiated iAP link restart during bootstrap (VW-866F quirk); restarting negotiation state")
+            generation=link.generation
+            linkEpoch=link.linkEpoch
+            control=current
+            // handoff 上下文绑定旧 generation/epoch，重同步后 current() 恒 false；
+            // 866F 无 Wi-Fi handoff 能力（wifiAnnouncement=false, carPlayStartSession=false），
+            // 直接作废，避免重同步后二次协商触碰已失效上下文抛 "Network handoff context retired"。
+            if (networkHandoff != null) {
+                networkHandoff = null
+                log("Handoff context superseded by VW-866F resynchronization; network handoff disabled for restarted negotiation")
+            }
+            transactions=PeerNegotiationController(if(order==IapStartupPolicy.Order.AUTH_FIRST)
+                FallbackAttempt.AUTH_FIRST else FallbackAttempt.IDENT_FIRST,
+                control.id,control.version,IapControlSessionKind.CARPLAY)
+            authDeadline=0L
+            identificationDeadline=0L
+            accessorySends=emptySet()
+            received=emptySet()
+            identified=null
+            handedOff=false
+            announcement=null
+            startConfig=null
+            startConfigValidated=null
+            networkHandoffConfig=null
+            optionalSent=false
+            announcementDeadline=0L
+            handoffDeadline=0L
+            startWaitLogged=false
+            certificateTransaction=null
+            cert=null
+            authenticationSchema=null
+            challenge=null
+            restartRequested=true
+        }
+        checkGeneration()
         fun checkDeadlines(){
             val now=System.nanoTime()
             val state=transactions.context(LinkTransport.BT_RFCOMM,ConnectionDirection.OUTBOUND)
@@ -367,6 +580,11 @@ object Bootstrap {
          *  固件里 0x1D03/0xAA04 没有入站处理器；本实现把它们当终止通知，放行以保留快速失败。 */
         val unconditionalInbound=setOf(0x0000,0x0004,0x0005,0x1d01,0x1d03,0x1d05,0x1d06,
             0xaa01,0xaa03,0xaa04)
+        // v14.17 (task 3): 0x5702 (RequestAccessoryWiFiConfigurationInformation) 是部分车机拉活
+        // AirPlay 服务的开关。发送后 1.5 s 内没有 5703 时单独记一条观测日志（不中断等待——总窗口
+        // 仍是 ANNOUNCEMENT_WAIT_MS），便于区分"没发 5702"和"发了但车机没激活服务"。
+        var announcementSentAt=0L
+        var announcementLateLogged=false
         fun inboundAllowed(id:Int):Boolean{
             if(id in unconditionalInbound)return true
             val state=transactions.context(LinkTransport.BT_RFCOMM,ConnectionDirection.OUTBOUND)
@@ -399,7 +617,10 @@ object Bootstrap {
             // waiting for a message the peer never promised to send.
             val routes=requireNotNull(identified).capabilities.networkHandoff
             if(routes.wifiAnnouncement){
+                // 顺序固定：4e09/4e0a/4e0e/4e0d 先发完，5702 后发（过早发送会让网络阶段无法启动）。
                 send(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
+                announcementSentAt=System.nanoTime()
+                log("5702 RequestAccessoryWiFiConfigurationInformation sent after 4e0d/4e0e; awaiting 5703 within "+ANNOUNCEMENT_WAIT_MS+"ms")
             }
             if(routes.carPlayStartSession){
                 send(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
@@ -414,9 +635,25 @@ object Bootstrap {
         try{
             while(true){
                 checkGeneration();checkDeadlines()
+                if(restartRequested){
+                    restartRequested=false
+                    log("iAP negotiation restarted after peer resynchronization; re-initiating auth/identification")
+                    // v14.17 (task 2): give 866F a short settle window after a peer-initiated
+                    // link restart. Re-issuing aa00 in the same instant races the peer's own
+                    // synchronization (observed: restart loops back-to-back). 300 ms is far
+                    // below every handshake deadline and only applies to the restart path.
+                    runCatching{Thread.sleep(300)}
+                    perform(transactions.preferredStart())
+                }
                 // Link ACK, early Wi-Fi config or remote AA/05 do not prove local authentication.
                 if(transactions.ready){
                     sendOptional()
+                    // v14.17 (task 3): 观测 5702 后 1.5s 是否拿到 5703（只记一次，不改变等待窗口）。
+                    if(!announcementLateLogged&&announcementSentAt!=0L&&announcement==null&&
+                        System.nanoTime()-announcementSentAt>1_500_000_000L){
+                        announcementLateLogged=true
+                        log("5703 still absent 1.5s after 0x5702; AirPlay service activation not confirmed (continuing to wait up to "+ANNOUNCEMENT_WAIT_MS+"ms)")
+                    }
                     if(runtimeSession){
                         handedOff=true
                         return ControlResult(null,requireNotNull(identified))
@@ -424,7 +661,12 @@ object Bootstrap {
                     // The production coordinator keeps consuming late messages after
                     // return. Hand off usable current-attempt credentials immediately;
                     // don't hold Android networking behind a missing4301/5703.
-                    networkHandoffConfig=networkHandoff?.configuration()
+                    // VW-866F quirk: no Wi-Fi handoff capability (wifiAnnouncement=false,
+                    // carPlayStartSession=false) -> the handoff context may already be
+                    // retired (context bound to first-negotiation link generation/epoch);
+                    // never touch it. Wi-Fi config comes from Identify(1d01) directly.
+                    val hasSupportedRoute=identified?.capabilities?.networkHandoff?.hasSupportedRoute==true
+                    networkHandoffConfig=if(hasSupportedRoute) networkHandoff?.configuration() else null
                     if(networkHandoffConfig!=null){
                         log("iAP network configuration ready; handing off while endpoint events remain active")
                         break
@@ -836,12 +1078,13 @@ object Bootstrap {
                     else->log("Unsupported handshake command "+command.id.toString(16)+"; ignored")
                 }
             }
-            val wifi=networkHandoffConfig?.copy(receiverCanReceive=received)?:if(startConfig!=null){
+            val currentStartConfig=startConfig
+            val wifi=networkHandoffConfig?.copy(receiverCanReceive=received)?:if(currentStartConfig!=null){
                 // Recheck against 57/03 only when that announcement exists; otherwise use
                 // the snapshot already validated at message receipt.
                 val parsed=if(announcement==null)startConfigValidated
-                    ?:wifiConfig(startConfig, null, previous, experimentalIntegrityOnly, log)
-                    else wifiConfig(startConfig,announcement,previous,experimentalIntegrityOnly,log)
+                    ?:wifiConfig(currentStartConfig, null, previous, experimentalIntegrityOnly, log)
+                    else wifiConfig(currentStartConfig,announcement,previous,experimentalIntegrityOnly,log)
                 parsed.copy(receiverCanReceive=received)
             }
                 else WifiBootstrap.networkOnly(requireNotNull(announcement),received)
@@ -945,6 +1188,10 @@ object Bootstrap {
     }
     suspend fun network(context:Context,b:WifiBootstrap,r:Resources,log:(String)->Unit,onFailure:(Throwable)->Unit):NetworkPath = suspendCancellableCoroutine{cont->
         val cm=context.getSystemService(ConnectivityManager::class.java)
+        // v14.23：join 段以前只在系统回调到达后才打日志，卡在"连接车机 Wi-Fi"时整段是空的。
+        // 这里先记一次请求参数，再由 4s 看门狗持续报"还没有任何回调"。
+        log("Wi-Fi join start ssid="+b.ssid+" security="+b.security+" passphrasePresent="+b.password.isNotEmpty()+
+            " endpointPresent="+(b.endpoint!=null))
         val stopped=java.util.concurrent.atomic.AtomicBoolean(false)
         val completion=java.util.concurrent.atomic.AtomicBoolean(false)
         val cancellationRegistration=java.util.concurrent.atomic.AtomicReference<CallbackRegistration?>()
@@ -1028,12 +1275,28 @@ object Bootstrap {
                 // Do not stop a live attempt on VPN/policy changes; actual socket I/O decides.
                 ready()
             }
-            override fun onUnavailable(){if(!stopped.get())reject(java.io.IOException("Wi-Fi request unavailable"))}
+            override fun onUnavailable(){
+                if(stopped.get())return
+                log("Wi-Fi request unavailable (receiver hotspot refused or not started; request has no matching SSID)")
+                reject(java.io.IOException("Wi-Fi request unavailable: 车机热点未就绪或系统未允许连接 "+b.ssid))
+            }
             override fun onLost(network:Network){if(!stopped.get()&&network==selected){
+                log("Wi-Fi lost before ready; delivered="+delivered)
                 val error=java.io.IOException("Wi-Fi lost")
                 if(delivered)onFailure(error)else reject(error)
             }}
         }
+        var joinTicks=0
+        val joinWatchdog=java.util.Timer("carvex-wifi-join",true)
+        joinWatchdog.scheduleAtFixedRate(object:java.util.TimerTask(){
+            override fun run() {
+                if(stopped.get()||completion.get())return
+                joinTicks+=1
+                log("Wi-Fi join still waiting elapsedMs="+(joinTicks*4_000)+" ssid="+b.ssid+
+                    " note=no NetworkCallback yet; check the system WLAN prompt and any other saved network")
+            }
+        },4_000,4_000)
+        r.own(AutoCloseable{joinWatchdog.cancel()})
         val registration=r.own(CallbackRegistration(
             {cm.requestNetwork(request,callback)},
             {cm.unregisterNetworkCallback(callback)}))

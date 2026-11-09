@@ -76,6 +76,15 @@ class MainAudioOwnership(private val log:(String)->Unit,private val announceHold
         synchronized(this){announced=false;state=State.UNKNOWN;log("MainAudio owner=unknown; own hold released")}
         if(!announceObserved(false))log("MainAudio owner release was not accepted; state stays unknown")
     }
+    /** Local-only release: resets our hold bookkeeping without announcing to the receiver.
+     * VW-866F RSTs a mid-session main-audio release announcement (90(1) 2ca997d3/cf22ea8c:
+     * healthy session, releaseOwn -> modesChanged -> SocketException). iPhone keeps main-audio
+     * ownership until the session ends, so a healthy session must never announce release;
+     * on TEARDOWN the whole control connection closes, no release announcement is needed. */
+    @Synchronized fun releaseOwnSilent(){
+        announced=false;state=State.UNKNOWN
+        log("MainAudio owner=unknown; own hold released locally (no announce)")
+    }
     /** Categories 1 and 3 send only while we hold main audio; unknown and receiver-held both withhold. */
     @Synchronized fun allowsMainSend():Boolean=state==State.OURS
 }

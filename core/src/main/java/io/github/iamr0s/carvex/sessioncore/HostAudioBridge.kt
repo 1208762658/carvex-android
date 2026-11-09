@@ -59,7 +59,7 @@ class HostAudioBridge(private val log:(String)->Unit,private val configureRoute:
         var lastArrival:Long?=null
         for(block in queue){
             val now=System.nanoTime()
-            if(closed.get()||active.get()[category]!==block.binding||!block.binding.transport.ready||now-block.queuedAt>100_000_000L){
+            if(closed.get()||active.get()[category]!==block.binding||!block.binding.transport.ready||now-block.queuedAt>300_000_000L){
                 dropped.incrementAndGet();converter=null;continue
             }
             try{

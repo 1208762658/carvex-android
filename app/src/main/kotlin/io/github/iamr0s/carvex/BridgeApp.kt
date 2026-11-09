@@ -27,6 +27,9 @@ class BridgeApp:Application(),MixingServiceOwner{
         // 宿主注册表仍然显式安装：它只描述"有哪些宿主"，与 DI 容器解耦。
         io.github.iamr0s.carvex.hostregistry.HostRegistry.install(
             *org.koin.core.context.GlobalContext.get().getAll<io.github.iamr0s.carvex.hostregistry.HostPlugin>().toTypedArray())
+        // 常驻 WiAP Source 发布（866F 适配）：蓝牙开启即注册 cafe/0a77 记录，
+        // 让车机链路建立后 0.3~1s 的发现窗口能命中手机，而不是等会话点连接才注册。
+        WiapSourcePublisher.start(this)
     }
 }
 object Permissions {

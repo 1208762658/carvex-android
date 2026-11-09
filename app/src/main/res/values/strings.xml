@@ -114,6 +114,7 @@
     <string name="method_bluetooth_hint">Nearby, low power</string>
     <string name="method_wifi">CarPlay-WIFI</string>
     <string name="method_wifi_hint">Same network, fast</string>
+    <string name="wifi_required_for_wireless_carplay">无线 CarPlay 依赖 Wi-Fi：请先在系统设置开启 Wi-Fi 并连接车机热点，再点击连接（蓝牙握手完成后将走 Wi-Fi 建立视频/音频通道）</string>
     <string name="method_usb">CarPlay-USB</string>
     <string name="method_usb_hint">Cable, most reliable</string>
     <string name="signal_strong">Strong signal</string>

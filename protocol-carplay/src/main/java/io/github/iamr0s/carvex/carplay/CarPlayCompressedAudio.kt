@@ -32,6 +32,16 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
     private var history:ByteArray?=null
     private var historyTimestamp=0L
     private var staleUnits=0L
+    /** v14.17 (task 5)：category2 的 AU 过期到阈值说明车机没在消费这条流（94 日志 staleAU
+     *  9→113、c2 age 34 s）。此后再发 silence 只会烧 CPU 并干扰主音频，直接停这条 lane。 */
+    private val staleLaneLimit=60L
+    private val laneStopped=AtomicBoolean(false)
+    private fun noteStale(){
+        staleUnits++
+        if(category==2&&staleUnits>=staleLaneLimit&&laneStopped.compareAndSet(false,true))
+            log("Audio category=2 stale AU budget exhausted staleAU="+staleUnits+
+                "; stopping the split lane instead of keeping it alive with silence")
+    }
     private var maximumQueueNanos=0L
     private var maximumWaitNanos=0L
     private var maximumWriteNanos=0L
@@ -48,9 +58,31 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
         log("${"Compressed audio category="}${category}${" failed: "}${t.javaClass.simpleName}${" "}${t.message}${"; audible acceptance pending"}")
         close()
     }
+    /** iPhone keeps a receiver audio stream warm with continuous RTP, including silence.
+     *  With no PCM source submitted (sourcePCMBytes=0) this client would send nothing and the
+     *  VW-866F drops the whole session ~10s later. Emit a 20ms silence block whenever no packet
+     *  went out recently, so the receiver sees a live stream while awaiting real audio. */
+    private fun startSilenceTicker(){
+        val blockBytes=selected.rate/50*selected.channels*2
+        val silence=ByteArray(blockBytes)
+        var tick=0L
+        scope.launch{
+            while(isActive){
+                delay(400)
+                if(closed.get()||socket.isClosed)break
+                val age=System.nanoTime()-lastSentNanos
+                if(age>300_000_000L&&ready&&canSend()&&!laneStopped.get()){
+                    if(encoder.submit(silence,selected.decodedPcm)){tick++
+                        if(tick==1L||tick%20==0L)log("Audio silence keepalive category="+category+" type="+streamType+
+                            " blocks="+tick+"; no source PCM, keeping stream alive")
+                    }
+                }
+            }
+        }
+    }
     private fun startWriter(){scope.launch(start=CoroutineStart.UNDISPATCHED){
         var config=false;var ownershipTaken=false;var firstTiming=true
-        val clock=AudioSendClock(selected.rate)
+        val clock=AudioSendClock(selected.rate,300_000_000L)
         fun clearHistory(){history=null;historyTimestamp=0L}
         fun timing(now:Long){
             if(timingLoggedAt!=0L&&now-timingLoggedAt<5_000_000_000L)return
@@ -58,6 +90,7 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
             log("Audio sender category="+category+" outputQueueMaxMs="+maximumQueueNanos/1_000_000+
                 " pacingWaitMaxMs="+maximumWaitNanos/1_000_000+" udpSendMaxMs="+maximumWriteNanos/1_000_000+
                 " staleAU="+staleUnits+" firstAuStartupMs="+clock.startupDelayNanos/1_000_000+
+                (if(::encoder.isInitialized){val s=encoder.statistics();" encoderSubmitted="+s.submittedBlocks+" encoderDropped="+s.droppedBlocks+" encoderUnits="+s.accessUnits}else{""})+
                 "; local timings only, receiver playout unmeasured")
             maximumQueueNanos=0;maximumWaitNanos=0;maximumWriteNanos=0
         }
@@ -92,19 +125,27 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
                         }
                         maximumQueueNanos=maxOf(maximumQueueNanos,System.nanoTime()-event.encodedAtNanos)
                         if(plan.discontinuity)clearHistory()
-                        if(!canSend()){clearHistory();continue}
+                        if(!canSend()||laneStopped.get()){clearHistory();continue}
                         if(!ownershipTaken){ownership();ownershipTaken=true}
                         if(clock.expired(plan,System.nanoTime())){
-                            staleUnits++;clearHistory();timing(System.nanoTime());continue
+                            noteStale();clearHistory();timing(System.nanoTime());continue
                         }
                         val wait=plan.dueNanos-System.nanoTime()
-                        if(wait>0){maximumWaitNanos=maxOf(maximumWaitNanos,wait);delay((wait+999999)/1000000)}
+                        if(wait>0){
+                            maximumWaitNanos=maxOf(maximumWaitNanos,wait)
+                            // CarWith 桥接下源时钟可能膨胀（due 间隔>21.3ms）：若严格按 due 强等待，
+                            // output 积压会卡住编码 worker、input 块 100ms 过期被静默丢弃
+                            // （91 日志实测丢 ~30% 采样 → 866F 播放卡顿）。改为编码完成即发：
+                            // 发送节奏跟随编码产出，RTP 时间戳仍按源 PTS 推算。
+                            if(wait>2_000_000L){/* encode-driven; do not stall the pipeline */}
+                            else delay((wait+999999)/1000000)
+                        }
                         check(ready)
-                        if(!canSend()){clearHistory();continue}
+                        if(!canSend()||laneStopped.get()){clearHistory();continue}
                         // Coroutine scheduling or ownership may have stalled while this AU was held.
                         // Do not replay it late, and do not make every later AU inherit that delay.
                         if(clock.expired(plan,System.nanoTime())){
-                            staleUnits++;clearHistory();timing(System.nanoTime());continue
+                            noteStale();clearHistory();timing(System.nanoTime());continue
                         }
                         // Keep source gaps for pacing/staleness/RED, but select wire timestamps
                         // from the SETUP reply. No unsent AU consumes the continuous RTP clock.
@@ -134,7 +175,7 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
     override suspend fun send(category:Int,pcm:ByteArray,format:PcmFormat){
         require(category==this.category&&format==selected.decodedPcm&&format.accepts(pcm.size))
         check(ready){"Compressed stream closed"}
-        if(!canSend())return
+        if(!canSend()||laneStopped.get())return
         if(!encoder.submit(pcm,format))log("${"Compressed audio category="}${category}${" source block dropped; encoder queue full"}")
     }
     override fun close(){
@@ -155,6 +196,7 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
                     " configuredPrimaryOnly="+transport.redDiagnostic.configured+" appliedPrimaryOnly="+transport.redDiagnostic.applied+
                     "; primary-only isolation; packet format fixed by validated SETUP negotiation")
                 transport.startWriter()
+                transport.startSilenceTicker()
                 transport.encoder=CompressedAudioEncoder.create(format,bitrate,{event->
                     // Bounded, cancellable backpressure. Configuration and access units remain
                     // ordered; the encoder has already returned any MediaCodec output buffer.

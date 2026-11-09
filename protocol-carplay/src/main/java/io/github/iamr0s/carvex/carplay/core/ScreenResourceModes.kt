@@ -13,7 +13,12 @@ class ScreenResourceModes {
         return value.toInt().takeIf{number.isFinite()&&number==it.toDouble()&&it in 1..2}
     }
     fun propose(params:Map<*,*>):State? {
-        if(params.keys.any{it !in setOf("resources","appStates")})return null
+        // VW-866F v14.14: changeModes carries reasonStr ("Category 1 overlay visible" /
+        // "Take Screen: Carplay canvas was left") as an informational field. Rejecting it
+        // made every overlay negotiation fail -> status:1 -> null-params modesChanged -> 422
+        // -> modes-writer channel failure -> TEARDOWN (90(1) 4c2e8a4f/fdac8d2d).
+        // reasonStr is advisory only; overlay ownership still follows resources.
+        if(params.keys.any{it !in setOf("resources","appStates","reasonStr")})return null
         val apps=params["appStates"]
         if(apps!=null&&(apps !is List<*>||apps.isNotEmpty()))return null
         val requests=params["resources"] as? List<*>?:return null

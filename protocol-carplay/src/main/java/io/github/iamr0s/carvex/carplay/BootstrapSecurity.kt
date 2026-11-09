@@ -39,7 +39,14 @@ internal object ExperimentalHapDiscovery {
             config.endpointSource!=SecurityEntry.DISCOVERY||!networkReady||!endpointValidated)return null
         val auth=config.authentication?:return null
         if(auth.generation!=binding.generation||auth.epoch!=binding.epoch||!auth.challengeSignatureVerified)return null
-        if(metadata.effectiveFeatureEvidence.has(38)!=true)return null
+        // VW-866F quirk: CarPlay endpoint (features bit38=HK_PAIRING_AND_ENCRYPT, bit32=CAR)
+        // advertises no Bonjour pk/pi (TXT carries only deviceid+features+srcvers). iOS pairs
+        // CarPlay endpoints over HAP without Bonjour pk (SRP M2 carries the accessory public
+        // key; setup code is the fixed CarPlay "3939"). iAP2 Bluetooth authentication plus a
+        // resolved endpoint is sufficient to attempt the PAIRED HAP route.
+        val evidence=metadata.effectiveFeatureEvidence
+        if(evidence.has(38)==true&&evidence.has(32)==true)return true
+        if(evidence.has(38)!=true)return null
         val pi=metadata.pairingId?:return null
         if(pi.isBlank()||pi.toByteArray(Charsets.UTF_8).size !in 1..1024||metadata.publicKey?.size!=32)return null
         val endpoint=config.endpoint?:return null

@@ -45,4 +45,11 @@ class MainActivity : ComponentActivity() {
             DeviceAppTheme(dark) { MainScreen(vm) }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        // 每次回到前台都检查常驻 WiAP Source 发布：权限在后台授予、蓝牙被打开、
+        // 或系统回收了 server socket 时在这里补注册（蓝牙开关广播也会触发）。
+        io.github.iamr0s.carvex.WiapSourcePublisher.ensureActive(this)
+    }
 }
