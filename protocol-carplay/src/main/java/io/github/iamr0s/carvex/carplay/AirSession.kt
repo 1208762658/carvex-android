@@ -831,6 +831,20 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         val mediaPath=sessionPath
         val screenReply=try{setupSession.screen(stream)}
             catch(t:RtspClient.StatusException){logSetupEncryptionRoute("video",t.status);throw t}
+        // AMCar 的 MIB3 Frida 实证（1.0.51 在 4420 实测稳定）：屏幕流 SETUP 200 之后，真机会在
+        // **控制通道**上发一条 iAP detect（POST /command iAPSendMessage），车机回 SYN，之后才 RECORD；
+        // 它的原话是「写在事件通道上时 MIB3 根本不读」。
+        // 我们这边 20008.2 / 20014 在 SETUP 与 RECORD 之间一个报文都没发，车机在 RECORD 后
+        // 1.9–65 ms 关掉控制连接（20014 那次 RECORD 自己还卡了 49 ms，成功会话只要 4 ms）。
+        // 补上这条 detect；失败只记日志，不影响后续 RECORD。carvex.iap.armOnAirPlay=0 可关。
+        if(System.getProperty("carvex.iap.armOnAirPlay")?.trim()!="0"){
+            runCatching{
+                c.plist("POST","/command",mapOf(
+                    "type" to "iAPSendMessage",
+                    "params" to mapOf("data" to byteArrayOf(0xFF.toByte(),0x55,0x02,0x00,0xEE.toByte(),0x10))))
+                log("iAP detect marker sent on control channel after screen SETUP; awaiting peer SYN before RECORD")
+            }.onFailure{log("iAP detect marker failed: "+(it.message?:it.javaClass.simpleName))}
+        }
         // 链路已可用于上行消息：打开 Now Playing 发布器，并把识别阶段暂存的 5000 订阅补上，
         // 否则车机的订阅在 Bootstrap 里被当未知命令丢弃，之后永远不会收到 5001。
         nowPlayingPublisher.linkReady(true)
