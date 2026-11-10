@@ -193,6 +193,7 @@ object Bootstrap {
                 }
             }
             fun select(socket:BluetoothSocket,direction:String){
+                BluetoothSoftReset.noteSuccess()
                 activeOutbound.compareAndSet(socket,null)
                 if(stopping.get()||!winnerSocket.compareAndSet(null,socket)){
                     // 另一条方向也连上了（以前只 release、不记录）：这决定了"双方各持一条连接"这种
@@ -288,7 +289,16 @@ object Bootstrap {
                             }
                         }
                         activeOutbound.set(null)
-                        if(isActive&&!stopping.get())failed("outbound",last?:java.io.IOException("No outbound RFCOMM candidate"))
+                        if(isActive&&!stopping.get()){
+                            // 20003/20003.1/20003.2 三份日志同一个结论：一条会话断掉之后，
+                            // 直接重连会在 100–600ms 内抛 read ret:-1（connect 内部 SDP/ACL 就被拒），
+                            // 中间隔到 86 秒也一样；只有把手机蓝牙关掉再开，车机才会清掉旧链路，
+                            // 下一次才回到 400–7000ms 的正常握手。这里把它自动化：
+                            // 连续两次全败才动手，冷却 90s，拿不到系统权限就记一行并停用。
+                            BluetoothSoftReset.noteFailure()
+                            if(!winner.isCompleted)BluetoothSoftReset.reset(adapter){log(it)}
+                            failed("outbound",last?:java.io.IOException("No outbound RFCOMM candidate"))
+                        }
                     }
                 }
                 val selected=withTimeout(65_000){winner.await()}
