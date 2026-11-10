@@ -410,7 +410,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
 
     /** 建立会话。返回 null 表示**这台车机没有可用显示**：控制会话与事件通道已经建好，但视频流与
      *  触摸与视频不绑定，独立按键仍可用。调用方按"仅音频/控制"继续。 */
-    fun prepare(onDisplayNegotiation:()->Unit = {}):Screen? {
+    fun prepare(onDisplayNegotiation:()->Unit = {},onScreenReady:(Screen)->Unit = {}):Screen? {
         events.requireCurrent()
         bootstrap.requireAuthenticatedBootstrap(options.experiment)
         // Advertise on usable local addresses before discovery/invitation; don't make the
@@ -792,6 +792,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         val w=display.width;val h=display.height;val fps=display.fps
         val result=Screen(w,h,fps,uuid,hidId,touch);screen=result
         log("INFO screen "+w+"x"+h+" fps="+fps+" touch="+(touch!=null))
+        // 编码器必须在媒体 SETUP 之前就建好并开跑。20008.2 的两次失败（1f92b6a4 / b7ccf0d8）
+        // 都是 RECORD 回 200 之后 45–65 ms 控制连接被切断，而那段时间里我方一个报文都没发；
+        // 成功会话（e28826f0 / 43f940c8）在 RECORD 后 76–110 ms 才打出 AVC selected——
+        // 也就是编码器的 create+configure 正好撞在车机的判定窗口里。奥迪 MIB3 那边之所以稳，
+        // 是因为它复用 CarLife 引擎已经在流的码流（零重编码），RECORD 之后无需现场起编码器。
+        // 这里让调用方在媒体 SETUP 之前把编码器起好，等价地消掉这个窗口。
+        runCatching{onScreenReady(result)}.onFailure{log("video pre-roll failed before media SETUP: "+(it.message?:it.javaClass.simpleName))}
         openEventChannel(setup,c)
         // 24A446 creates the RCS during endpoint activation, after the initial
         // SETUP response and /info, not after media RECORD (0x251ae2228 and

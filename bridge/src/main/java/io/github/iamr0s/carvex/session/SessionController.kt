@@ -796,9 +796,22 @@ class SessionController(
                 true
             }}
             air.requestKeyFrame={video?.requestIdr()?:false}
-            val screen=phase(Stage.PAIR,90000){air.prepare{
+            // v16：媒体 SETUP 之前先把编码器冷启动的代价付掉（见 VideoEncoder.warmup）。
+            // 这里同步执行，不额外起线程——它必须发生在 video SETUP 与 RECORD 之前，
+            // 报酬是 phase(Stage.SETUP) 里创建编码器不再需要 60–110 ms。
+            val screen=phase(Stage.PAIR,90000){air.prepare({
                 if(!ended.get())BridgeStore.update(id){it.copy(stage=Stage.SETUP,detail=Stage.SETUP.title,error=null)}
-            }}
+            },{s->
+                val ok=runCatching{
+                    val frame=minOf(s.fps,60)
+                    // 钩子不是协程体，取不到宿主 format（h.format 是 suspend）；传 null 让
+                    // candidates() 按"硬件优先"自己挑，落到的就是 c2.qti.avc.encoder，
+                    // 与正式路径选中的是同一个码器。
+                    VideoEncoder.warmup(s.width,s.height,frame,nominalBitrate(s.width,s.height,frame),null)
+                }.getOrDefault(false)
+                BridgeStore.log(id,"Encoder pre-roll before media SETUP: display="+s.width+"x"+s.height+
+                    " fps="+s.fps+" warmed="+ok)
+            })}
             handoff.targetAttach(targetRef,peerCandidate)
             check(handoff.airplayReady(targetRef).committed)
             cutoverTimer.cancel(false)
@@ -903,14 +916,17 @@ class SessionController(
                     val device=h.invoke("carlife_request_device_id")
                     device?.getString("device_id")?.let{BridgeStore.log(id,"Host device_id="+BridgeStore.redact(it))}
                 }
-                // The app owns the surface first: splash, then either the host or our own page.
-                val local=openLocalVideoContent(id,v.surface,hostWidth,hostHeight,fps)
-                if(local!=null){
-                    local.show(LocalVideoPhase.SPLASH)
-                    BridgeStore.log(id,"${"Splash page shown for "}${SPLASH_MILLIS}${"ms; hostExpected="}${fromHost}")
-                    delay(SPLASH_MILLIS)
-                    if(fromHost)runCatching{local.close()}
-                    else{
+                // v16：车机自己会画的时候不摆 splash。原来的 1.5 s 过渡把「surface 交给车机」
+                // 推到了 RECORD 之后 1.6 s——而车机在 RECORD 后几十毫秒就判定这条流（20008.2
+                // 的 45–65 ms 断链）。这里有宿主接手，首帧越早到越好，不需要本地过渡页。
+                if(fromHost){
+                    BridgeStore.log(id,"host owns the frame source: splash skipped so the first frame can follow RECORD immediately")
+                }else{
+                    val local=openLocalVideoContent(id,v.surface,hostWidth,hostHeight,fps)
+                    if(local!=null){
+                        local.show(LocalVideoPhase.SPLASH)
+                        BridgeStore.log(id,"${"Splash page shown for "}${SPLASH_MILLIS}${"ms; hostExpected=false"}")
+                        delay(SPLASH_MILLIS)
                         // No host takes the surface, so the app-owned page stays for the whole session.
                         r.own(local);local.show(LocalVideoPhase.SCREEN)
                         // 画面留在这里，触摸的落点也登记上：宿主没人接时事件会落到这张页面上。
@@ -918,11 +934,11 @@ class SessionController(
                         // This page repaints on request, which is exactly what keeps the media stream
                         // alive while it stays still - and it never needed a front surface for that.
                         v.repeatFrame={local.heartbeat()}
+                    }else{
+                        // Neither a host nor an app-owned display: nothing can ever produce a frame, so
+                        // report the real reason now instead of waiting for the first-frame deadline.
+                        error("本地画面不可用：无法创建私有虚拟屏，请查看日志中的 Local display unavailable")
                     }
-                }else if(!fromHost){
-                    // Neither a host nor an app-owned display: nothing can ever produce a frame, so
-                    // report the real reason now instead of waiting for the first-frame deadline.
-                    error("本地画面不可用：无法创建私有虚拟屏，请查看日志中的 Local display unavailable")
                 }
                 if(fromHost){
                     // The host renders into whatever surface it is handed and never repaints on its own,

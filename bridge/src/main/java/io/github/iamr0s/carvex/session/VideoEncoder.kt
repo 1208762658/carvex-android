@@ -27,6 +27,30 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
          *  and the silence that follows is what a receiver reports as a lost video, so one repeat a
          *  second keeps packets flowing at the cost of a single tiny P frame. */
         const val IDLE_REPEAT_INTERVAL_MS=1_000L
+        /**
+         * 媒体 SETUP 之前的编码器预热：只做「选码器 + create + configure + release」这一步，
+         * 不建 surface、不编码。
+         *
+         * 为什么需要：20008.2 里成功与失败的唯一分界线是 `AVC selected` 有没有在 RECORD 后
+         * 几十毫秒内打出来——`makeEncoder()` 的 `createByCodecName` + `configure` 冷启动实测
+         * 60–110 ms，正好压在车机的判定窗口上。这里把冷启动的代价提前到 RECORD 之前付掉，
+         * 之后 phase(Stage.SETUP) 里再建同一档参数的编码器只需十几毫秒。
+         *
+         * 参数取不到就用调用方给的兜底值；任何失败只返回 false，绝不影响会话。
+         */
+        fun warmup(width:Int,height:Int,fps:Int,bitrate:Int,hostFormat:Bundle?):Boolean =
+            runCatching{
+                val candidate=candidates(hostFormat).firstOrNull()?:return@runCatching false
+                val format=MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC,width,height)
+                format.setInteger(MediaFormat.KEY_COLOR_FORMAT,MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                format.setInteger(MediaFormat.KEY_BIT_RATE,bitrate)
+                format.setInteger(MediaFormat.KEY_FRAME_RATE,fps)
+                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL,1)
+                val codec=MediaCodec.createByCodecName(candidate.info.name)
+                codec.configure(format,null,null,MediaCodec.CONFIGURE_FLAG_ENCODE)
+                codec.release()
+                true
+            }.getOrDefault(false)
         private data class Candidate(val info:MediaCodecInfo,val caps:MediaCodecInfo.CodecCapabilities)
         private fun candidates(hostFormat:Bundle?):List<Candidate> {
             return MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
