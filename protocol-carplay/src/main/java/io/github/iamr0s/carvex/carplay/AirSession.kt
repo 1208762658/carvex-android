@@ -983,7 +983,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         .joinToString(",",prefix="{",postfix="}"){
             val value=it.value
             it.key.toString()+"="+when(value){
-                is ByteArray->"bytes["+value.size+"]"
+                // 20015 那轮活了 10.03 秒后车机主动关闭，而它在这 10 秒里反复推的
+                // iAPSendMessage 只记了 bytes[26]，内容全丢。小载荷直接打 hex，
+                // 才能看出车机到底在要什么（需要 ack 的指令还是 NowPlaying 更新）。
+                is ByteArray->"bytes["+value.size+"]"+(if(value.size<=80)" "+hex(value,80) else "")
                 is Map<*,*>->summarize(value)
                 is List<*>->"list["+value.size+"]"
                 else->value.toString().take(64)
