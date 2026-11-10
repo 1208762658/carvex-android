@@ -1086,8 +1086,21 @@ object Bootstrap {
             if(active!=null&&caps!=null&&caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)){
                 val current=(caps.transportInfo as? android.net.wifi.WifiInfo)?.ssid?.trim('"')
                 val properties=cm.getLinkProperties(active)
-                if(!current.isNullOrEmpty()&&current==b.ssid&&properties!=null&&
+                // Android 13+ 没有 NEARBY_WIFI_DEVICES 时 WifiInfo.ssid 恒为 "<unknown ssid>"，
+                // 光靠 SSID 比较等于把"用户已经手动连上热点"这件事彻底看不见，只能无条件
+                // requestNetwork 然后等系统的 onUnavailable（实测 29s，车机侧 19s 就拆链）。
+                // 这里补一条不依赖权限的判据：本机已有 IPv4 与 4301/5703 给出的车机地址同 /24，
+                // 就是已经在那个热点上，直接复用现有 lease。
+                val peer=runCatching{java.net.InetAddress.getByName(b.endpoint?.address ?: "")}.getOrNull()
+                val localV4=properties?.linkAddresses?.map{it.address}?.filterIsInstance<java.net.Inet4Address>().orEmpty()
+                val sameSubnetV4=peer is java.net.Inet4Address&&localV4.any{
+                    val lb=it.address;val pb=peer.address
+                    lb.size==4&&pb.size==4&&lb[0]==pb[0]&&lb[1]==pb[1]&&lb[2]==pb[2]
+                }
+                val ssidMatches=!current.isNullOrEmpty()&&current==b.ssid
+                if((ssidMatches||sameSubnetV4)&&properties!=null&&
                     NetworkLinkReadiness.isReady(properties.interfaceName,properties.linkAddresses.map{it.address})){
+                    log("Wi-Fi lease reusable: ssidMatch="+ssidMatches+" sameSubnetV4="+sameSubnetV4+" ssid="+(current?:"<unknown>"))
                     val monitoring=java.util.concurrent.atomic.AtomicBoolean(true)
                     val monitor=object:ConnectivityManager.NetworkCallback(){
                         override fun onLost(network:Network){if(monitoring.get()&&!stopped.get()&&network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))}
