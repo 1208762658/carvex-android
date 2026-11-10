@@ -1165,6 +1165,18 @@ object Bootstrap {
         cancellationRegistration.set(registration)
         if(stopped.get())registration.close()
         registration.start()
+        // Android 的 WifiNetworkSpecifier 在"扫不到该 SSID"时要挂满 ~29s 才回调 onUnavailable。
+        // 成功会话里 L2 起链只要 1.03s（12:33:41.773 Wi-Fi callbacks ready），29s 全是白等，
+        // 而且这段等待期间车机的残留会话还在老化。12s 判死，余量是正常路径的 11 倍。
+        val joinWatchdog=java.util.concurrent.Executors.newSingleThreadScheduledExecutor{r->Thread(r,"wifi-join-watchdog").also{it.isDaemon=true}}
+        joinWatchdog.schedule({
+            if(!stopped.get()&&!completion.get()){
+                log("Wi-Fi join timed out after 12000ms: SSID="+b.ssid+" not advertised; car-side hotspot is off, retry will not help until it comes back")
+                reject(java.io.IOException("Wi-Fi join timed out after 12000ms: SSID="+b.ssid+" not advertised (car-side hotspot off)"))
+                registration.close()
+            }
+        },12,java.util.concurrent.TimeUnit.SECONDS)
+        r.own(AutoCloseable{joinWatchdog.shutdownNow()})
     }
     fun address(properties:LinkProperties,text:String):InetAddress {
         val parsed=IpLiteral.parse(text)
