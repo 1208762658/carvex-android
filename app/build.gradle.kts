@@ -69,8 +69,10 @@ fun gitOutput(vararg args:String):String? = runCatching {
 
 val gitCommitCount = gitOutput("rev-list","--count","HEAD")?.toIntOrNull()
 
-/** 20000 + 提交数，保证版本号在任何机器、任何 CI 上都单调且一致。 */
-val releaseVersionCode = (gitCommitCount ?: 1)+20000
+/** 20000 + 提交数，保证版本号在任何机器、任何 CI 上都单调且一致。
+ *  下限 20003：v15.0 之后从 20003 起持续递增；即使切到别的分支、浅克隆或非 git 环境
+ *  也不会回退成 20001/20002 —— Android 不允许覆盖安装低版本号。 */
+val releaseVersionCode = maxOf((gitCommitCount ?: 0)+20000, 20003)
 val releaseVersionName = releaseVersionCode.toString()
 
 /** 提交号优先取 CI 环境变量，其次读签出本身，都不是 git 仓库时回退 local。 */
