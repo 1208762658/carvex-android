@@ -301,8 +301,13 @@ class IapLink(input:InputStream, private val output:OutputStream,
         val id=if(f.flags and 0xa0==0&&p.size>=6&&p[0]==0x40.toByte()&&p[1]==0x40.toByte()&&IapWire.u16(p,2)>=6)
             IapWire.u16(p,4) else null
         val metadata=if(id==null)"" else " csm="+id.toString(16)
-        return f.flags.toString(16)+"/"+f.seq+"/"+f.ack+"/"+f.session+"/"+p.size+metadata
+        // 对端字节级对齐需要 SYN 载荷原文（maxOutgoing/maxLength/retry/会话表都在里面），
+        // 之前的摘要行只有长度。只给前 48 个帧带 hex，避免长时间会话把日志撑爆。
+        val budget=hexFrameBudget.getAndUpdate{ if(it>0)it-1 else 0 }
+        val raw=if(budget>0&&p.isNotEmpty())" hex="+hex(p,0,minOf(p.size,48)) else ""
+        return f.flags.toString(16)+"/"+f.seq+"/"+f.ack+"/"+f.session+"/"+p.size+metadata+raw
     }
+    private val hexFrameBudget=java.util.concurrent.atomic.AtomicInteger(48)
     private fun write(f:IapWire.Frame) = synchronized(writeLock) {
         check(!closed.get()){"iAP link closed"}
         val packet=IapWire.packet(f,packetVersion)
