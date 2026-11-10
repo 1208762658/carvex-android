@@ -101,11 +101,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private var shared:ByteArray?=null
     private var mfi:AccessoryAuth.Mfi?=null
     private val streamId=Crypto.random.nextLong().and(Long.MAX_VALUE).coerceAtLeast(1)
-    /** v14.20：写线程会在 socket 写阻塞期间持有 send 的实例锁，所以重建路径只替换这个
-     *  volatile 引用、不抢锁；send 每次调用都重新读它。 */
-    @Volatile private var video:Socket?=null
-    /** 重建视频通道要重放同一份 screen 请求（streamConnectionID 基于会话 streamId）。 */
-    @Volatile private var screenStream:Map<String,Any?>?=null
+    private var video:Socket?=null
     // This observer has its own short state lock; polling never waits for the video monitor.
     private val videoDiagnostics=VideoSendDiagnostics(log=log,
         extraThreads={listOfNotNull(client?.diagnosticReaderThread())})
@@ -133,17 +129,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private val audioTransports=java.util.concurrent.ConcurrentHashMap<Int,NegotiatedAudioTransport>()
     @Volatile private var videoFrames=0L
     @Volatile private var lastVideoNanos=0L
-    /** v14.17 (task 7)：RECORD 是否已 200，用于 EOF 来源诊断（区分建链期与运行期）。 */
-    @Volatile private var recordAccepted=false
-    /** v14.17 (task 1): 视频 keepalive 与帧发送原先共用 `synchronized(this)`，帧写阻塞时
-     *  keepalive 等同一把锁数十秒（90/94 日志 lock-wait 42 s）。keepalive 改用独立锁：它仍与
-     *  socket 写串行（SocketOutputStream 自身线程安全），但不等加密/序号计算，且写超时 watchdog
-     *  会在 6 s 内关闭 socket，把最坏阻塞从 46 s 降到 6 s。 */
-    private val videoWriteLock=Any()
     /** Local recovery policy: remember explicit navigation SETUP refusals for this session only. */
     private val rejectedPromptRoutes=java.util.concurrent.ConcurrentHashMap.newKeySet<CarPlayAudioPlan.Route>()
-    /** v14.17 (task 5)：回退路由拿不到接收端反馈时置位，category2 一律不再出包（含 silence）。 */
-    @Volatile private var category2NoFeedback=false
     /** 每条流响应里的 streamID，仅用于诊断；固件音频关闭路径不把它写入 TEARDOWN。 */
     private val audioStreamIds=java.util.concurrent.ConcurrentHashMap<String,Long>()
     private fun audioKey(type:Int,purpose:String)="$type/$purpose"
@@ -174,19 +161,6 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             if(command.id==0x5003)nowPlayingPublisher.setInfo(requireNotNull(command.fields))
             else{
                 val subscribeFields=requireNotNull(command.fields)
-                if(command.id==NowPlayingUpdate.START){
-                    // v14.18 (2026-11-09): the 5000 subscription carries the attribute ids this
-                    // receiver actually wants. Printing them turns "artwork attribute id is
-                    // unverified" from a guess into something the head unit itself states, so a
-                    // single log tells us which id carries artwork (and which requested ids this
-                    // encoder does not implement yet).
-                    val parsed=NowPlayingUpdate.selection(subscribeFields)
-                    val wanted=parsed?.orderedAttributes?.joinToString(","){a->a.group.toString()+":"+a.id.toString(16)}?:"invalid"
-                    val unknown=parsed?.orderedAttributes?.filter{a->a !in NowPlayingUpdate.implemented.attributes}
-                        ?.distinct()?.joinToString(","){a->a.group.toString()+":"+a.id.toString(16)}?:"none"
-                    log("NowPlaying 5000 subscription attributes="+wanted+" infoMask="+(
-                        parsed?.infoMask?.toString()?:"n/a")+" requested-but-unimplemented="+unknown)
-                }
                 nowPlayingPublisher.command(command.id,subscribeFields)
                 if(command.id==NowPlayingUpdate.START){
                     // VW-866F v14.2 (2026-11-02): v14 sent 0x4e0d immediately at CONTROL_READY;
@@ -294,75 +268,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         if(stopping)return // Normal stop owns cleanup; rejected late business is not a new failure.
         // Reader, deadline and waiting writers may observe the same terminal cause.
         if(!channelFailed.compareAndSet(false,true))return
-        // v14.17 (task 7)：EOF 必须能区分"对端 FIN / 本端关闭 / 读被截断"，否则 203 那种
-        // "RECORD 200 后控制通道 EOF" 只能靠猜。截断前缀（Truncated n/m）表示读到一半，
-        // 通常是对端在报文中间关闭；消息里没有前缀且本端未停止，则更可能是对端 FIN。
-        val message=t.message?:"no message"
-        val truncated=message.contains("Truncated",ignoreCase=true)
-        val origin=when{
-            stopping->"local-stop"
-            truncated->"remote-close-mid-message"
-            t is java.io.EOFException->"remote-fin-suspected"
-            else->"unknown"
-        }
-        log("${"channel source="}${source}${" "}"+t.javaClass.simpleName+" "+message+" origin="+origin+
-            " recordAccepted="+recordAccepted+" videoBytes="+videoFrames)
-        // v14.20：先落盘现场，再交给上层失败处理 —— 之后日志会被下一次连接的输出冲掉，
-        // 而"车机无 display / 拒收视频 / 蓝牙被关"三种断链只能靠当时的字段区分。
-        dumpFailureSnapshot(source,t,origin)
+        log("${"channel source="}${source}${" "}"+t.javaClass.simpleName+" "+(t.message?:"no message"))
         failure(t)
-    }
-    /** v14.20：断链现场落盘（`filesDir/session_live.txt`，每次覆盖，只保留最近一次）。
-     *  异步线程写、限时 fsync、任何失败只记一行日志，不阻塞控制读线程。
-     *  开关 `carvex.session.dumpOnFailure=0` 可关闭。落盘本身不会减少 `read ret: -1`；
-     *  它的用途是把三种断链区分开：车机没声明 display、车机拒收视频、蓝牙被外部关闭。 */
-    private fun dumpFailureSnapshot(source:String,t:Throwable,origin:String){
-        val enabled=System.getProperty("carvex.session.dumpOnFailure")?.trim()?.let{it!="0"}?:true
-        if(!enabled){log("session snapshot skipped (carvex.session.dumpOnFailure=0)");return}
-        runCatching{
-            Thread({
-                try{
-                    val file=java.io.File(context.filesDir,"session_live.txt")
-                    val now=System.currentTimeMillis()
-                    val videoSocket=video
-                    val screenInfo=screen?.let{it.width.toString()+"x"+it.height.toString()+"@"+it.fps.toString()}?:"none"
-                    val bluetooth=runCatching{android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.isEnabled}
-                        .getOrNull()?.toString()?:"unknown"
-                    val net=runCatching{network.toString()}.getOrNull()?:"unknown"
-                    fun esc(s:String?)=s.orEmpty().replace("\\","/").replace("\"","'").replace("\n"," ")
-                    val body=buildString{
-                        append("{\n")
-                        append("  \"time\": ").append(now).append(",\n")
-                        append("  \"iso\": \"").append(esc(java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ",java.util.Locale.US).format(java.util.Date(now)))).append("\",\n")
-                        append("  \"streamId\": ").append(streamId).append(",\n")
-                        append("  \"source\": \"").append(esc(source)).append("\",\n")
-                        append("  \"origin\": \"").append(esc(origin)).append("\",\n")
-                        append("  \"error\": \"").append(esc(t.javaClass.name+": "+(t.message?:"no message"))).append("\",\n")
-                        append("  \"recordAccepted\": ").append(recordAccepted).append(",\n")
-                        append("  \"videoFrames\": ").append(videoFrames).append(",\n")
-                        append("  \"videoSocket\": ")
-                        append(if(videoSocket==null)"null" else
-                            "\"local="+videoSocket.localPort+" remote="+videoSocket.port+" closed="+videoSocket.isClosed+
-                            " connected="+videoSocket.isConnected+"\"")
-                        append(",\n")
-                        append("  \"screen\": \"").append(esc(screenInfo)).append("\",\n")
-                        append("  \"lastVideoAgeMs\": ").append(if(lastVideoNanos==0L)"-1" else
-                            ((System.nanoTime()-lastVideoNanos)/1_000_000).toString()).append(",\n")
-                        append("  \"bluetoothEnabled\": ").append(bluetooth).append(",\n")
-                        append("  \"network\": \"").append(esc(net)).append("\"\n")
-                        append("}\n")
-                    }
-                    java.io.FileOutputStream(file).use{out->
-                        out.write(body.toByteArray())
-                        out.flush()
-                        out.fd.sync()
-                    }
-                    log("session snapshot written path="+file.absolutePath+" bytes="+body.length)
-                }catch(e:Exception){
-                    log("session snapshot failed: "+e.javaClass.simpleName+" "+(e.message?:""))
-                }
-            },"session-live-dump").apply{isDaemon=true;start()}
-        }.onFailure{e->log("session snapshot dispatch failed: "+e.javaClass.simpleName)}
     }
     /** SETUP 被拒时点名加密路线：本实现只有 MFi/SAP（`et=16` + `ekey`/`eiv`），没有 FairPlay `/fp-setup`
      *  （W-0024：CarPlay 接收端也不走 FairPlay）。接收端若只认 FairPlay，恰好死在 SETUP 这一步，
@@ -826,52 +733,16 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // 车机没有给出可用显示不是"会话失败"，而是"这台车机在这一层能力更少"：视频流与 HID 设备
         // 视频与触摸无从建立；独立按键、控制会话与事件通道照旧 —— docs §9.8 的降级表
         // 把这条写成"无 displays 字段 ⇒ 不开视频，仅音频"。返回 null 让调用方按无屏会话继续。
-        // v14.20：/info 没有 display 声明时不再自造 1354x666@60 直接 RECORD。
-        // 304 日志（6aacdbfa）证明自造流的后果：车机没有显示消费端，视频 TCP 写不出去，
-        // 6 秒看门狗断 socket → 黑屏，并把车机留在半开会话里（随后一串 read ret: -1）。
-        // 车机页面就绪后 display 通常会回来，所以在同一控制连接上 0/1/2 s 串行重取，总窗口 ≤3 s。
-        var display=runCatching{DisplayCapabilities.select(info["displays"],localFps,log)}.getOrElse{t->
+        val display=runCatching{DisplayCapabilities.select(info["displays"],localFps,log)}.getOrElse{t->
             log("receiver /info offers no usable display ("+t.javaClass.simpleName+"："+(t.message?:"no detail")+")")
-            null
-        }
-        if(display==null){
-            // 回滚开关：carvex.display.requireDeclared=0 恢复 v14.19 的自造流行为。
-            val requireDeclared=System.getProperty("carvex.display.requireDeclared")?.trim()?.let{it!="0"}?:true
-            if(requireDeclared){
-                var recovered=false
-                for((attempt,waitMs) in listOf(0L,1_000L,2_000L).withIndex()){
-                    if(waitMs>0)try{Thread.sleep(waitMs)}catch(e:InterruptedException){Thread.currentThread().interrupt()}
-                    if(stopping)break
-                    val refetched=runCatching{setupSession.refetchInfo()}.getOrElse{t->
-                        log("display declare refetch attempt="+(attempt+1)+"/3 failed "+t.javaClass.simpleName+
-                            (t.message?.let{"："+it}?:""));null
-                    }?:continue
-                    val selected=runCatching{DisplayCapabilities.select(refetched["displays"],localFps,log)}.getOrNull()
-                    log("display declare refetch attempt="+(attempt+1)+"/3 displays="+
-                        DisplayCapabilities.summary(refetched["displays"]))
-                    if(selected!=null){
-                        display=selected;recovered=true
-                        log("display declaration recovered on /info attempt="+(attempt+1)+"; video SETUP may proceed")
-                        break
-                    }
-                }
-                if(!recovered){
-                    log("receiver-no-display: /info lacks a usable display after 3 attempts (3 s window);"+
-                        " no video SETUP and no RECORD; tearing down cleanly so the head unit does not keep a half-open stream."+
-                        " Reopen the CarPlay page on the head unit or restart it, then retry")
-                    runCatching{setupSession.closeScreen()}
-                    throw java.io.IOException("receiver-no-display: /info has no display capabilities after 3 attempts")
-                }
-            }else if(metadata.effectiveFeatureEvidence.has(AirPlayFeature.SCREEN.bit)==true){
-                log("VW-866F display capabilities absent from /info; falling back to 1354x666@60 screen stream"+
-                    " (carvex.display.requireDeclared=0 rollback)")
-                display=DisplayCapabilities.Selected(-1,null,1354,666,60,java.util.UUID.randomUUID().toString(),
+            if(metadata.effectiveFeatureEvidence.has(AirPlayFeature.SCREEN.bit)==true){
+                log("VW-866F display capabilities absent from /info; falling back to 1354x666@60 screen stream")
+                DisplayCapabilities.Selected(-1,null,1354,666,60,java.util.UUID.randomUUID().toString(),
                     "fallback: /info lacks display capabilities, SCREEN feature advertised")
-            }
+            }else null
         }
         val uuid=display?.uuid
         val screenRequest=display?.let{CarPlaySetupRequests.screen(streamId,it.uuid)}
-        screenStream=screenRequest
         var hidId:String?=null;var touch:HidTouch?=null
         var touchAmbiguous=false
         val hid=(info["hidDevices"] as? List<*>)?.filterIsInstance<Map<*,*>>().orEmpty()
@@ -955,31 +826,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             log("Now Playing subscription replayed from bootstrap")
         }
         video=connectedSocket(address,screenReply.dataPort)
-        // v14.17 (task 7)：RECORD 之前先确认视频 RTP 这条 TCP 已连上且未关闭。203 的失败形态是
-        // RECORD 200 后车机等不到首帧就关掉控制连接；端口未就绪在这里先暴露，而不是让对端去猜。
-        val videoTransport=video
-        if(videoTransport==null||videoTransport.isClosed||!videoTransport.isConnected){
-            log("video RTP port not ready before RECORD socket="+(videoTransport?.let{"closed="+it.isClosed+" connected="+it.isConnected}?:"null"))
-            error("Video RTP transport not ready before RECORD")
-        }else log("video RTP port ready before RECORD local="+videoTransport.localPort+" remote="+videoTransport.port)
         // RECORD 没有正文（第 06 章）；发空 plist 会让对端把已配置的流当成无输入。
         // URL 用连接 URL（固件 0x24fda58ec：'recr' 包不设自己的 URL，落到连接 URL
         // `rtsp://<host>/<u64>`），与控制连接同一条会话，不能用 "/"。
         setupSession.start()
-        recordAccepted=true
-        log("RECORD accepted; video RTP transport live, awaiting first encoded frame before any teardown decision")
-        // v14.17 (task 9)：RECORD 后 200–500 ms 看门狗。成功会话（d437813d）在 RECORD 后很快收到
-        // 车机推来的 RTSP `iAPSendMessage` 并进入 iAP over AirPlay v2；失败会话（18ba6698/d851394f）
-        // 在同一个窗口里没有这个事件，随后控制连接被 EOF 关闭。这里只观测、不 teardown：
-        // 窗口到期还没事件时，把"谁没动"（车机没推 vs 本端帧源/控制通道被宿主占用）写清楚。
-        scope.launch{
-            delay(500)
-            if(stopping||!recordAccepted)return@launch
-            if(iapEventSeen.get()==0)
-                log("RECORD watchdog: no iAPSendMessage within 500ms of RECORD; head unit has not started iAP over AirPlay yet"+
-                    " (frames="+videoFrames+" tunnel="+(tunnel!=null)+" screen="+(screen!=null)+
-                    "); keep the session, do not teardown")
-        }
         // 屏幕流保活帧（第 07 章 §2.6.1）：固件在同一个生产者里发 128 字节明文头、`0x04 = 2`、
         // 无正文；它是屏幕数据口上的独立存活信号，不是视频流量的备份。周期未在固件中还原，取 1 s。
         // 单次写失败只记日志：保活失败不该把整个会话判死，拆除由对端决定。
@@ -1066,30 +916,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         }else{
             log("low-power keepalive absent (SETUP response has no keepAlivePort)")
         }
-        // v14.17 (task 6)：A/B 开关。203 两次失败的共同新变量是"modesChanged 返回 200、
-        // hidSetInputMode 返回 200 + HID armed"，而 202 成功会话里这两条都被 422 拒绝后忽略。
-        // modesChanged 在 866F 上本来就被 422 忽略（非必需通知），因此默认跳过；需要 A/B 时
-        // 用 carvex.ab.skipModes=0 恢复原行为。跳过只删掉这一条通知，不影响视频/音频链路。
-        val skipModes=System.getProperty("carvex.ab.skipModes")?.let{it=="1"}?:true
-        if(skipModes){
-            log("modesChanged skipped (A/B control: 203 sessions died after RECORD with 200 here; set carvex.ab.skipModes=0 to restore)")
-        }else runCatching{c.plist("POST","/command",modes())}.onFailure{t->
-            if(t is StatusException&&t.status==422){
-                // VW-866F v14.3: the DIRECT path (context superseded, fresh pair-setup)
-                // rejects modesChanged with 422 while PIPELINE accepted it (200) - the head
-                // unit is not in a state where it accepts a mode change yet. modesChanged is
-                // a non-critical AirPlay notification: log and continue instead of failing
-                // the whole session (7device-log.txt 04bfbca5 died here before CONTROL_READY,
-                // so the v14.2 4e0d+4e0e after NowPlaying was never reached on DIRECT).
-                log("modesChanged status=422 ignored (VW-866F DIRECT path); continuing")
-            }else throw t
-        }
+        c.plist("POST","/command",modes())
         // HID 武装（第 10 章 §2.6）：固件把 `hidSetInputMode` 发到**传输控制流**，字段是
         // `{uuid, hidInputMode}`；没有武装过的触摸设备，报告可能根本不来。这里逐设备发一次。
-        // v14.17 (task 6)：A/B 开关 carvex.ab.skipHid=1 可跳过武装（默认保留，触摸正常依赖它）。
-        val skipHid=System.getProperty("carvex.ab.skipHid")=="1"
-        val armTargets=if(skipHid)emptyList()else hidArmUuids.distinct()
-        if(skipHid)log("HID input mode arming skipped (A/B control); touch reports rely on advertised descriptors")
+        val armTargets=hidArmUuids.distinct()
         var armed=0
         var unsupported=false
         for(uuid in armTargets){
@@ -1310,31 +1140,6 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** Cache real metadata until this Link subscribes. False means no selected update was sent. */
     fun nowPlaying(track:NowPlayingUpdate.Track,replaceMedia:Boolean=false):Boolean =
         nowPlayingPublisher.update(track,replaceMedia)
-    /** v14.17 (task 4)/v14.18：专辑封面分包发送（默认开启，`carvex.artwork=0` 关闭）。
-     *  v14.19 (2026-11-09)：上一版把图分包塞进 0x5001 的做法已由 301device-log 证伪 ——
-     *  866F 的 5000 订阅集里根本没有 0x0e/0x0f，那 8 帧按未订阅属性被丢弃（标题未受影响）。
-     *  iPhone 侧反汇编 f_100145e70 证明封面是两段式：
-     *    1) 组 0 参数 0x1a = U8 的 file transfer id（MsgAddU8Param 单字节，不带图片数据）；
-     *    2) 图片本身走 iAP2 文件传输会话（04-nowplaying.md A04.6）。
-     *  本版先把第 1 段按原样发出（id 由 token 低字节派生），让车机回话后据此确定第 2 段的
-     *  帧格式；在文件传输落地前不再发送任何伪造的图片分包。 */
-    fun artwork(token:Int,jpeg:ByteArray,format:Int=ArtworkTransfer.FORMAT_JPEG):Boolean{
-        if(!nowPlayingPublisher.subscribed()){log("artwork discarded: no active 5000 subscription");return false}
-        val transferId=ArtworkTransfer.transferId(token)
-        // v14.20 guard：文件传输会话还没实现，就不存在"真实的 transfer id"。此时发 0x1a 只会
-        // 被车机静默丢弃（304 日志：发出 id=59 之后零回应），还会让日志看起来像"封面已发送"。
-        // 需要继续探路时用 carvex.artwork.announce=1 显式打开，日志会标明 unverified。
-        val announce=System.getProperty("carvex.artwork.announce")?.trim()?.let{it=="1"}?:false
-        if(!announce){
-            log("artwork id suppressed: no iAP2 file transfer created yet; 0x5001/0x1a id="+transferId+
-                " would be unverified and silently dropped (carvex.artwork.announce=1 re-enables the probe)")
-            return false
-        }
-        val ok=runtime.send(NowPlayingUpdate.ID,ArtworkTransfer.idFields(transferId))
-        log("artwork id announced 0x5001/0x1a id="+transferId+" jpegBytes="+jpeg.size+
-            " sent="+ok+" wirePixels=0 unverified/no-transfer (probe mode; iAP2 file transfer still unimplemented)")
-        return ok
-    }
     /** Firmware message 5201. The caller must have an active 5200 subscription. */
     fun navigationRouteUpdate(values:List<Pair<Int,ByteArray>>):Boolean =
         if(!NavigationGuidance.active) false
@@ -1494,18 +1299,6 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     "; no output writer created; closing this stream")
                 throw t
             }
-            // v14.17 (task 5)：分流 category2 在首选路由被 400 拒绝后回退到 type=101/default 时，
-            // 866F 会回 200 但 controlPort=null、RED 未协商，实测车机根本不消费这条流（car2 只发
-            // silence keepalive，staleAU 从 9 涨到 113）。这里只对"回退后的路由"做严格校验：
-            // 正常首选路径即使没有 controlPort 也照旧放行，避免把老行为改坏。
-            if(category==2&&rejectedPromptRoutes.isNotEmpty()){
-                val controlPort=(stream["controlPort"] as? Number)?.toInt()?.takeIf{it in 1..65535}
-                if(controlPort==null||!redEnabled){
-                    category2NoFeedback=true
-                    log("Audio category=2 fallback route has no receiver feedback controlPort="+(controlPort?:"null")+
-                        " RED="+redEnabled+"; suppressing the split lane instead of streaming silence into it")
-                }
-            }
             log("Audio category="+category+" type="+route.type+" RED offered="+offeredRed+" response="+
                 stream["supportsRTPPacketRedundancy"]+" sendRED="+redEnabled)
             val takeOwnership:suspend ()->Unit={
@@ -1524,10 +1317,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             }
             val transport=if(candidate.codec==CarPlayAudioPlan.Codec.PCM16)
                 CarPlayMediaAudio(udp,address,port,format,category,route.type,key,retransmit,takeOwnership,releaseStream,log,redEnabled,
-                    canSend={!stopping&&((category==2&&!category2NoFeedback)||audioOwnership.allowsMainSend())},
+                    canSend={!stopping&&(category==2||audioOwnership.allowsMainSend())},
                     receiverHighAccuracyTimestamps=receiverHighAccuracyTimestamps)
             else CarPlayCompressedAudio.create(udp,address,port,category,route.type,candidate,key,retransmit,takeOwnership,releaseStream,log,
-                canSend={!stopping&&((category==2&&!category2NoFeedback)||audioOwnership.allowsMainSend())},redEnabled=redEnabled,
+                canSend={!stopping&&(category==2||audioOwnership.allowsMainSend())},redEnabled=redEnabled,
                 receiverHighAccuracyTimestamps=receiverHighAccuracyTimestamps)
             transportRef.set(transport)
             val combined=microphone?.let{DuplexAudioTransport(transport,it)}?:transport
@@ -1628,10 +1421,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         return monotonicUs/1000+offset
     }
     /** 屏幕流保活帧（第 07 章 §2.6.1）：128 字节明文头、`0x04=2`、无正文，不消耗帧 nonce。 */
-    private fun keepAliveFrame():Unit=videoDiagnostics.trace("keepalive"){ticket->synchronized(videoWriteLock){
+    private fun keepAliveFrame():Unit=videoDiagnostics.trace("keepalive"){ticket->synchronized(this){
         if(stopping)return@synchronized
-        val socket=video?:return@synchronized
         videoDiagnostics.phase(ticket,VideoSendDiagnostics.Phase.ENCRYPT)
+        val socket=video?:return@synchronized
         val packet=VideoWire.keepAlive()
         videoDiagnostics.phase(ticket,VideoSendDiagnostics.Phase.SOCKET_WRITE)
         socket.getOutputStream().write(packet)
@@ -1669,32 +1462,6 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** 拆屏幕流：文档 06 章 §2.5 要求"先注销本地流、再发 TEARDOWN"，失败不回滚注销。
      *  正文是 `streams` 数组；`teardownType` 是固件里的**条件字段**（会话 `+0x10 != 0` 才写），
      *  其取值语义仍 `[OPEN]`，所以这里不发，避免发出猜的枚举值。 */
-    /** v14.20：一次视频写阻塞后的通道重建。
-     *  只换媒体流：旧流 TEARDOWN → 新 screen SETUP → 新 socket → 重发 RECORD；控制会话、事件
-     *  通道与 audio 全部保留。返回 false 表示重建没成功，调用方按旧策略结束会话。
-     *  这里故意不 `synchronized(this)`：send 在 socket 写阻塞时正持有该锁，抢锁会互相等死。 */
-    fun recoverVideoTransport():Boolean{
-        val setup=setupLifecycle?:return false
-        val stream=screenStream?:return false
-        if(stopping||screen==null)return false
-        return runCatching{
-            log("video transport recovery: rebuilding the screen stream (control/audio untouched)")
-            setup.closeScreen()
-            val reply=setup.screen(stream)
-            val socket=connectedSocket(address,reply.dataPort)
-            val previous=video
-            video=socket
-            runCatching{previous?.close()}
-            val recorded=setup.restartRecord()
-            if(recorded)recordAccepted=true
-            log("video transport rebuilt: local="+socket.localPort.toString()+" remote="+socket.port.toString()+
-                " record="+recorded.toString()+"; control and audio untouched")
-            true
-        }.getOrElse{t->
-            log("video transport recovery failed: "+t.javaClass.simpleName+" "+(t.message?:"no message"))
-            false
-        }
-    }
     fun teardownScreen(reason:String){
         setupLifecycle?.closeScreen()
     }

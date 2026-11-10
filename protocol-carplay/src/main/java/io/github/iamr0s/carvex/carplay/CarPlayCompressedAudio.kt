@@ -32,16 +32,6 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
     private var history:ByteArray?=null
     private var historyTimestamp=0L
     private var staleUnits=0L
-    /** v14.17 (task 5)：category2 的 AU 过期到阈值说明车机没在消费这条流（94 日志 staleAU
-     *  9→113、c2 age 34 s）。此后再发 silence 只会烧 CPU 并干扰主音频，直接停这条 lane。 */
-    private val staleLaneLimit=60L
-    private val laneStopped=AtomicBoolean(false)
-    private fun noteStale(){
-        staleUnits++
-        if(category==2&&staleUnits>=staleLaneLimit&&laneStopped.compareAndSet(false,true))
-            log("Audio category=2 stale AU budget exhausted staleAU="+staleUnits+
-                "; stopping the split lane instead of keeping it alive with silence")
-    }
     private var maximumQueueNanos=0L
     private var maximumWaitNanos=0L
     private var maximumWriteNanos=0L
@@ -71,7 +61,7 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
                 delay(400)
                 if(closed.get()||socket.isClosed)break
                 val age=System.nanoTime()-lastSentNanos
-                if(age>300_000_000L&&ready&&canSend()&&!laneStopped.get()){
+                if(age>300_000_000L&&ready&&canSend()){
                     if(encoder.submit(silence,selected.decodedPcm)){tick++
                         if(tick==1L||tick%20==0L)log("Audio silence keepalive category="+category+" type="+streamType+
                             " blocks="+tick+"; no source PCM, keeping stream alive")
@@ -125,10 +115,10 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
                         }
                         maximumQueueNanos=maxOf(maximumQueueNanos,System.nanoTime()-event.encodedAtNanos)
                         if(plan.discontinuity)clearHistory()
-                        if(!canSend()||laneStopped.get()){clearHistory();continue}
+                        if(!canSend()){clearHistory();continue}
                         if(!ownershipTaken){ownership();ownershipTaken=true}
                         if(clock.expired(plan,System.nanoTime())){
-                            noteStale();clearHistory();timing(System.nanoTime());continue
+                            staleUnits++;clearHistory();timing(System.nanoTime());continue
                         }
                         val wait=plan.dueNanos-System.nanoTime()
                         if(wait>0){
@@ -141,11 +131,11 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
                             else delay((wait+999999)/1000000)
                         }
                         check(ready)
-                        if(!canSend()||laneStopped.get()){clearHistory();continue}
+                        if(!canSend()){clearHistory();continue}
                         // Coroutine scheduling or ownership may have stalled while this AU was held.
                         // Do not replay it late, and do not make every later AU inherit that delay.
                         if(clock.expired(plan,System.nanoTime())){
-                            noteStale();clearHistory();timing(System.nanoTime());continue
+                            staleUnits++;clearHistory();timing(System.nanoTime());continue
                         }
                         // Keep source gaps for pacing/staleness/RED, but select wire timestamps
                         // from the SETUP reply. No unsent AU consumes the continuous RTP clock.
@@ -175,7 +165,7 @@ class CarPlayCompressedAudio private constructor(private val socket:DatagramSock
     override suspend fun send(category:Int,pcm:ByteArray,format:PcmFormat){
         require(category==this.category&&format==selected.decodedPcm&&format.accepts(pcm.size))
         check(ready){"Compressed stream closed"}
-        if(!canSend()||laneStopped.get())return
+        if(!canSend())return
         if(!encoder.submit(pcm,format))log("${"Compressed audio category="}${category}${" source block dropped; encoder queue full"}")
     }
     override fun close(){

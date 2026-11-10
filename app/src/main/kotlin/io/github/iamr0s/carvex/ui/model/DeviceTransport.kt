@@ -52,15 +52,6 @@ class RealDeviceTransport(private val context: Context) : DeviceTransport {
         }
         check(Permissions.granted(context)) { context.getString(R.string.required_permission_error) }
         withContext(Dispatchers.IO) {
-            // v14.16 (2026-11-04): wireless CarPlay depends on Wi-Fi (the 866F opens its own
-            // hotspot; RTSP video/audio runs over it after the Bluetooth iAP2 handshake). A
-            // Wi-Fi-off phone therefore always fails right after handshake with an EOF that
-            // reads like a protocol bug. Detect it at the connect entry and fail fast with a
-            // clear message instead of letting the user discover it from the session log.
-            val wifi = context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
-            if (wifi?.isWifiEnabled == false) {
-                throw IllegalStateException(context.getString(R.string.wifi_required_for_wireless_carplay))
-            }
             // SessionController reads this target when the service starts. The service itself
             // owns the real Bluetooth/iAP2 handshake and foreground lifecycle.
             BridgeStore.configure(BridgeStore.options.value.copy(target = device.address.uppercase()))

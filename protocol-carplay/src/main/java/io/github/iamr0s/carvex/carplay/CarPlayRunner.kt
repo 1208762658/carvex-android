@@ -111,11 +111,6 @@ class CarPlayRunner(
         val joinStartedAt=android.os.SystemClock.elapsedRealtime()
         val network = run {
             val joined = join(bootstrap)
-            // v14.22：306 的 DIRECT 分支只有入口一行、没有结果，无法判断是 join 失败还是
-            // Bonjour 没发现。这里把两段都打出来。
-            host.log("DIRECT Wi-Fi join ok in "+(android.os.SystemClock.elapsedRealtime()-joinStartedAt)+"ms"+
-                " iface="+joined.properties.interfaceName+
-                " links="+joined.properties.linkAddresses.joinToString(","))
             joined
         }
         val discoveryStartedAt=android.os.SystemClock.elapsedRealtime()
@@ -131,9 +126,6 @@ class CarPlayRunner(
         return try {
             discovery.start()
             val metadata = discovery.await()
-            host.log("DIRECT Bonjour resolved host="+metadata.endpoint?.hostAddress+" port="+metadata.port+
-                " deviceId="+(metadata.deviceId?.take(12))+" elapsedMs="+
-                (android.os.SystemClock.elapsedRealtime()-discoveryStartedAt))
             val resolved = bootstrap.resolved(
                 requireNotNull(metadata.endpoint?.hostAddress),
                 requireNotNull(metadata.port),
@@ -143,8 +135,6 @@ class CarPlayRunner(
             )
             NetworkHandoffPipeline.Ready(network, publication, resolved)
         } catch(t:Exception){
-            host.log("DIRECT Bonjour discovery failed: "+t.javaClass.simpleName+" "+(t.message?:"")+
-                "; handoff context untouched")
             throw t
         } finally {
             resources.release(discovery)

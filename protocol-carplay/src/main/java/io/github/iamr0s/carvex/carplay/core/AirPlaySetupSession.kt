@@ -59,15 +59,6 @@ internal class AirPlaySetupSession(
         return ControlReply(optionalPort(response,"eventPort"),optionalPort(response,"keepAlivePort"),enabled as? List<*>)
     }
 
-    /** v14.20：/info 的 display 声明只在车机打开 CarPlay 页面后才出现（304 日志里同一设备
-     *  前三次会话有 displays 条目、后两次完全没有）。允许在同一控制连接上重取一次快照：
-     *  只清缓存，不改变其它能力消费（audio/HID/features 仍来自首次响应）。 */
-    fun refetchInfo():Map<String,Any?> {
-        current()
-        infoSnapshot=null
-        return info()
-    }
-
     fun info():Map<String,Any?> {
         current()
         infoSnapshot?.let{return it}
@@ -108,14 +99,6 @@ internal class AirPlaySetupSession(
         log(if(skipRecord)"RECORD omitted by SETUP skipRecord; visual acceptance pending"
             else "RECORD accepted; visual acceptance pending")
         return !skipRecord
-    }
-
-    /** v14.20：视频通道重建后重发 RECORD。旧流已由 closeScreen 的 TEARDOWN 注销，这里只清
-     *  本地 started 标志；控制会话与 audio 流完全不动。 */
-    @Synchronized fun restartRecord():Boolean {
-        current()
-        started=false
-        return start()
     }
 
     /** Unregister before sending, including prepare failures before an encoder
