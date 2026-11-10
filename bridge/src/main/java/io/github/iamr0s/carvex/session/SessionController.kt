@@ -94,12 +94,18 @@ class SessionController(
                 }
                 if(attempt<Int.MAX_VALUE)attempt++
                 if(!isActive)break
+                // 只观测：把这次尝试那一刻的 Wi-Fi 状态固定下来，供事后统计成功率用。
+                // adapter 状态由 bluetooth ready gate 记；这里补的是"车机热点是否已在"。
+                BridgeStore.log("","wifi observation: "+WifiObservation.describe(context))
                 val id=BridgeStore.begin(attempt)
                 try { attempt(id,options,fromHost);break }
                 catch(t:kotlinx.coroutines.CancellationException){throw t}
                 catch(t:Exception){
                     currentCoroutineContext().ensureActive()
                     BridgeStore.log(id,"failure: "+t.javaClass.simpleName+" "+(t.message?:""))
+                    // 失败现场的 Wi-Fi 状态：与上面那条 attempt 时刻的观测配对，
+                    // 才能看出"热点先连上"到底改变了多少。
+                    BridgeStore.log(id,"wifi at failure: "+WifiObservation.describe(context))
                     // 空消息的异常（例如候选为空时抛的那条 IllegalStateException）只靠类型无法定位，把栈截断打出来。
                     BridgeStore.log(id,"failure stack: "+t.stackTraceToString().take(2048))
                     BridgeStore.log(id,ProtocolTrace.event(BridgeStore.state.value.stage.name,"session","local","attempt","failed",t.javaClass.simpleName))
