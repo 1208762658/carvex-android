@@ -38,6 +38,9 @@ private const val MIN_BITRATE=1_000_000
  *  退避到 30 秒后 5 次仍然全败，说明继续试只是继续打车机，而不是"再多一次机会就会成"。 */
 private const val FAIL_STREAK_LIMIT=5
 
+/** RECORD 刚过就被切断（对端崩溃重启）时，至少等这么久再碰它。 */
+private const val PEER_CRASH_COOLDOWN_SEC=20
+
 /** 按像素率估算码率：约 0.13 bit/像素/帧，最低 1 Mbps。
  *  例：1080p30≈8.1 Mbps、720p30≈3.6 Mbps、1080p60≈16.2 Mbps。 */
 private fun nominalBitrate(width:Int,height:Int,fps:Int):Int {
@@ -109,6 +112,7 @@ class SessionController(
                 catch(t:kotlinx.coroutines.CancellationException){throw t}
                 catch(t:Exception){
                     currentCoroutineContext().ensureActive()
+                    val stageAtFailure=BridgeStore.state.value.stage
                     BridgeStore.log(id,"failure: "+t.javaClass.simpleName+" "+(t.message?:""))
                     // 失败现场的 Wi-Fi 状态：与上面那条 attempt 时刻的观测配对，
                     // 才能看出"热点先连上"到底改变了多少。
@@ -151,8 +155,14 @@ class SessionController(
                     val backoffSec=when(consecutiveFailures){
                         1->2;2->5;3->10;4->20;else->30
                     }
-                    val waitSec=maxOf(options.retryIntervalSeconds,backoffSec)
-                    BridgeStore.log(id,"retry backoff: attempt="+consecutiveFailures+" wait="+waitSec+"s")
+                    // RECORD 刚过就 EOF：对端在"准备收视频"那一刻把控制连接关掉，20008.2 里这种
+                    // 形态后面紧跟着车机整机重启。把它当成对端崩溃，而不是普通断链 —— 多留一段时间，
+                    // 别在它重启的过程中反复握手。
+                    val peerCrash=t is java.io.EOFException&&stageAtFailure in setOf(Stage.SETUP,Stage.WAIT_FRAME)
+                    var waitSec=maxOf(options.retryIntervalSeconds,backoffSec)
+                    if(peerCrash)waitSec=maxOf(waitSec,PEER_CRASH_COOLDOWN_SEC)
+                    BridgeStore.log(id,"retry backoff: attempt="+consecutiveFailures+" wait="+waitSec+"s"+
+                        (if(peerCrash)" peer crashed after RECORD (stage="+stageAtFailure.name+")" else ""))
                     delay(waitSec*1000L)
                 }
             }
@@ -817,9 +827,17 @@ class SessionController(
                 val receiverFps=activeScreen.fps
                 val hostFpsHint=(format?.getInt("fps") ?: format?.getInt("maxFPS"))?.takeIf{it>0}
                 val limit=minOf(receiverFps,hostFpsHint?:Int.MAX_VALUE)
+                // 车机没给帧率提示（hostFpsHint=null）时，60 完全是我们自己按接收端能力取满的。
+                // 20008.2 的 1f92b6a4 / b7ccf0d8 两次都是"SETUP/RECORD 全 200 -> 46/65 ms 控制连接
+                // 被切断 -> 车机随机整机重启"，最可能是它那边的视频通道吃不下 1354x666@60 这个负载。
+                // 先按更接近 iPhone 原生的档位跑：默认 30fps；carvex.video.fps 可单独回滚。
+                val fpsCap=(System.getProperty("carvex.video.fps")?.trim()?.toIntOrNull() ?: 30).takeIf{it>0}
+                val negotiatedFpsLimit=limit
+                val fpsLimit=if(fpsCap!=null&&fpsCap<negotiatedFpsLimit)fpsCap else negotiatedFpsLimit
                 val supported=VideoEncoder.supportedFps(format)
-                val fps=requireNotNull(supported(hostWidth,hostHeight,limit)){"No supported initial FPS"}
-                BridgeStore.log(id,"Video limits: receiverFPS="+receiverFps+" hostFpsHint="+hostFpsHint+" limit="+limit+" chosen="+fps)
+                val fps=requireNotNull(supported(hostWidth,hostHeight,fpsLimit)){"No supported initial FPS"}
+                BridgeStore.log(id,"Video limits: receiverFPS="+receiverFps+" hostFpsHint="+hostFpsHint+
+                    " negotiated="+negotiatedFpsLimit+" cap="+fpsCap+" chosen="+fps)
                 // 码率：取双方候选里的**最高**；车机建议若基于更大的画布，先按像素比缩到实际编码尺寸。
                 // 编码器的 bitrateRange 只用于夹取上限，永远不当候选值。
                 val videoCeiling=VideoEncoder.supportedBitrate(format)?.last?.takeIf{it>0}
@@ -835,6 +853,13 @@ class SessionController(
                 val candidates=listOfNotNull(normalizedHint,nominal)
                 var bitrate=candidates.max()
                 bitrate=videoCeiling?.let{bitrate.coerceAtMost(it)} ?: bitrate
+                // 车机也没给码率提示（hostHint=null），7.03 Mbps 是按像素率估出来的。
+                // 和帧率同理：先压到 4 Mbps，carvex.video.maxBitrate 可单独回滚（0 表示不设上限）。
+                val bitrateCap=System.getProperty("carvex.video.maxBitrate")?.trim()?.toIntOrNull() ?: 4_000_000
+                if(bitrateCap>0&&bitrate>bitrateCap){
+                    BridgeStore.log(id,"Video bitrate capped for receiver: requested="+bitrate+" cap="+bitrateCap)
+                    bitrate=bitrateCap
+                }
                 bitrate=bitrate.coerceAtLeast(MIN_BITRATE)
                 BridgeStore.log(id,"Video bitrate="+bitrate+" candidates="+candidates+
                     " (hostHint="+hostHint+" normalized="+normalizedHint+" nominal="+nominal+
@@ -871,7 +896,7 @@ class SessionController(
                     frontSurface=o.frontSurface&&fromHost)
                 val v=r.own(makeEncoder(fps));video=v
                 BridgeStore.log(id,"${"AVC selected name="}${v.encoderName}${" hardware="}${v.hardwareAccelerated}${" size="}${hostWidth}${"x"}${hostHeight}${" fps="}${fps}${" bitrate="}${v.initialBitrate}")
-                BridgeStore.update(id){it.copy(width=hostWidth,height=hostHeight,targetFps=fps,maxFps=limit,targetBitrate=v.initialBitrate)}
+                BridgeStore.update(id){it.copy(width=hostWidth,height=hostHeight,targetFps=fps,maxFps=fpsLimit,targetBitrate=v.initialBitrate)}
                 v.start()
                 // Observation only, once per session: ask the host what it offers and record the replies.
                 // Neither answer changes local behaviour yet - they are here to be read off a real car.
