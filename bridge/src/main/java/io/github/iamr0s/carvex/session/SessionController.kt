@@ -85,6 +85,13 @@ class SessionController(
         job=scope.launch {
             var attempt=0
             while(isActive){
+                // 自动重置蓝牙那 40 秒里不要空转：每一轮都会在 OFF 状态下打一份完整的失败日志，
+                // 还会和 reset 抢同一个适配器。这里只等，等重置收尾后立刻继续连。
+                if(BluetoothSoftReset.isResetting()){
+                    var waited=0L
+                    while(isActive&&BluetoothSoftReset.isResetting()&&waited<60_000L){delay(1_000);waited+=1_000}
+                    if(!isActive)break
+                }
                 if(attempt<Int.MAX_VALUE)attempt++
                 if(!isActive)break
                 val id=BridgeStore.begin(attempt)
@@ -102,8 +109,12 @@ class SessionController(
                         TransportErrorCategory.PLATFORM_UNSUPPORTED,TransportErrorCategory.PERMISSION_DENIED,
                         TransportErrorCategory.INTERFACE_BIND_FAILED,
                         TransportErrorCategory.AUTH_FAILED,TransportErrorCategory.IDENTIFICATION_REJECTED)
-                    val terminal=(t is IapStartupTimeout)||terminalTransport||t is PairUnsupported||t is SecurityException||t is IllegalArgumentException||t is IllegalStateException||
-                        accessoryRejected||t is DigestRequired
+                    // 自动重置蓝牙期间（adapter 处于 OFF）失败是必然的，不能按 terminal 收尾：
+                    // 否则 SecurityException/IllegalStateException 会把整条重连流程 break 掉，
+                    // 重置完成后也没人再去连车机。
+                    val resetting=BluetoothSoftReset.isResetting()
+                    val terminal=!resetting&&((t is IapStartupTimeout)||terminalTransport||t is PairUnsupported||t is SecurityException||t is IllegalArgumentException||t is IllegalStateException||
+                        accessoryRejected||t is DigestRequired)
                     if(terminal){
                         BridgeStore.update(id){it.copy(stage=Stage.FAILED,detail="在 "+it.stage.title+" 阶段失败",error=BridgeStore.redact(t.message?:t.javaClass.simpleName))}
                         break
