@@ -248,6 +248,10 @@ object Bootstrap {
                     log("RFCOMM outbound attempt order="+outboundCandidates.map{it.service.outboundLabel}+
                         "; simultaneous listener="+listeners.isNotEmpty())
                     workers+=launch(Dispatchers.IO){
+                        // 400 日志（v14.15 原包）：9 次失败的 connect 全在 91-110ms 抛 read ret:-1，
+                        // 期间蓝牙栈自己 off/on 重启了两轮（00:15:24 off → 00:15:26 on → 00:16:03 off → 00:16:09 on），
+                        // 成功那次握手 5.79s。所以出站前先等"栈就绪"；超时也放行，只记录不阻断。
+                        BluetoothReadyGate.awaitReady(adapter,device,BluetoothReadyGate.READY_TIMEOUT_MS){log(it)}
                         var last:Exception?=null
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch
@@ -261,8 +265,9 @@ object Bootstrap {
                                 continue
                             }
                             r.own(socket);activeOutbound.set(socket)
+                            val startedAt=android.os.SystemClock.elapsedRealtime()
                             log("RFCOMM outbound $direction connect deadline=5s basis="+candidate.basis+
-                                " policy=sdk_uuid_hint_probe")
+                                " policy=sdk_uuid_hint_probe state="+BluetoothReadyGate.stateLabel(adapter))
                             trace("tx",direction,"attempt",candidate.basis.name)
                             val deadlineJob=launch{delay(20_000);if(winnerSocket.get()!==socket)runCatching{socket.close()}}
                             try{
@@ -276,8 +281,10 @@ object Bootstrap {
                                 activeOutbound.compareAndSet(socket,null)
                                 if(winnerSocket.get()!==socket)r.release(socket)
                                 if(t is CancellationException||t is SecurityException)throw t
+                                val elapsedMs=android.os.SystemClock.elapsedRealtime()-startedAt
                                 if(isActive&&!stopping.get())log("RFCOMM $direction failed before iAP: "+t.javaClass.simpleName+
-                                    " "+(t.message?:"")+"; SDP record absence not established")
+                                    " "+(t.message?:"")+"; SDP record absence not established elapsedMs=$elapsedMs fingerprint="+
+                                    BluetoothReadyGate.classify(elapsedMs,t,adapter))
                             }
                         }
                         activeOutbound.set(null)
