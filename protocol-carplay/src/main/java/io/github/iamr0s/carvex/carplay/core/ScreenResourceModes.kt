@@ -24,9 +24,17 @@ class ScreenResourceModes {
         val requests=params["resources"] as? List<*>?:return null
         if(requests.size!=1)return null
         val r=requests.single() as? Map<*,*>?:return null
-        if(r.keys!=setOf("resourceID","transferType"))return null
         fun integer(v:Any?):Int? {val n=v as? Number?:return null;val d=n.toDouble();if(!d.isFinite()||d!=n.toInt().toDouble())return null;return n.toInt()}
         val resource=integer(r["resourceID"])?:return null;val transfer=integer(r["transferType"])?:return null
+        // 866F 实测（20003device-log.txt 04:32:04.161431）：借出 overlay（transferType=3）时车机
+        // 在 resource 项里额外带 transferPriority=500 / unborrowConstraint=1000。旧白名单只认
+        // resourceID+transferType，这一项被判 null → status:1（空 params）→ 不 echo →
+        // 2.87s 后车机关控制 TCP（04:32:07.033049 EOFException Truncated 0/2），
+        // 之后 11 次重连全部 read ret:-1（04:33:40–04:35:39）。
+        // 借用约束只在"借出"这一档放行；永久接管(1/2)与归还(4)仍严格，未处理的约束照旧拒绝。
+        val allowedKeys=if(transfer==3)setOf("resourceID","transferType","transferPriority","unborrowConstraint")
+                        else setOf("resourceID","transferType")
+        if(r.keys.any{it !in allowedKeys})return null
         if(resource==1)return when(transfer){
             1->if(state.borrowed)null else state.copy(owner=2,permanent=2,borrowed=false)
             2->if(state.borrowed)null else state.copy(owner=1,permanent=1,borrowed=false)
