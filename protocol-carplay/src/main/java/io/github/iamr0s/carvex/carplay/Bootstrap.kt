@@ -148,6 +148,8 @@ object Bootstrap {
         val servicePlan=WiapBluetoothPolicy.plan(device.uuids?.map{it.uuid},o.listen)
         log("Bluetooth target paired="+bonded+" uuidSource=platform_cache observation="+servicePlan.observation+
             " uuidCount="+servicePlan.cachedUuidCount+" freshness=unverified fullSdp=unavailable")
+        // 对端要按 UUID/SCN 对齐通道，只给数量不够，把平台缓存里的 UUID 原文打出来。
+        log("Bluetooth cached UUIDs: "+(device.uuids?.map{it.uuid.toString()}?.distinct()?.joinToString(",") ?: "<none>"))
         return coroutineScope {
             // 只注册普通手机 WiAP 角色；Sink 是固件的替代角色，不是额外兼容监听。
             // 公共 SDK 的两个 listener 仍是独立 channel，也不能自定义 SDP profile 属性。
@@ -1055,6 +1057,8 @@ object Bootstrap {
         }
         if(security!=0)require(password.toByteArray(Charsets.UTF_8).size in 8..63){"${"receiver Wi-Fi password length "}${password.length}${" is outside 8..63 (security type "}${security}${")"}"}
         log("4301 endpoint fields validated; addressCount="+addresses.size+" security="+security+" keyPresent="+(pub!=null))
+        // 对端要在"热点不在广播"时决定怎么办，必须有 SSID 原文；密码与 pin 一律不打。
+        log("4301 hotspot ssid="+ssid+" address="+address+" port="+port+" security="+security)
         // Construct the complete endpoint before the default startSession snapshot.
         // copy(endpoint=...) alone would otherwise retain an incomplete startSession.
         val endpoint=BootstrapEndpoint(address,port,receiver,pub,addresses=addresses,startSessionPeerInfo=peerInfo)
