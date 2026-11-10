@@ -39,10 +39,13 @@ class IapLink(input:InputStream, private val output:OutputStream,
               private val localCumulativeAckTimeoutMs:Int=10,
               private val localMaxRetransmissions:Int=30,
               private val localMaxCumulativeAck:Int=0,
-              /** 打开后等对端开口的时限；到点仍无任何字节就发一次 Detect（指南 §3.3 的 T_first_byte）。 */
-              private val firstByteTimeoutMs:Int=2000,
-              /** 首字节时限之后等首个 SYN 的时限；到期还没有 SYN 就判 NO_SYN 并拆链（T_detect）。 */
-              private val detectTimeoutMs:Int=5000):AutoCloseable {
+              /** 打开后等对端开口的时限；到点仍无任何字节就发一次 Detect（指南 §3.3 的 T_first_byte）。
+               * 1200ms：三个成功会话里对端最慢 723ms 就发 detect，2s 只会让"车机没起来"那次
+               * 白白占用时间并把重试拖成 7 秒一轮。 */
+              private val firstByteTimeoutMs:Int=1200,
+              /** 首字节时限之后等首个 SYN 的时限；到期还没有 SYN 就判 NO_SYN 并拆链（T_detect）。
+               * 1500ms：对端既然已经沉默，再等 5s 只是继续捶它，反而把它的残留态坐实。 */
+              private val detectTimeoutMs:Int=1500):AutoCloseable {
     /** EAK body is a list of received PSNs; missing PSNs are derived locally. */
     enum class EakSchema { UNSUPPORTED, EAK_RECEIVED_LIST_V1 }
     enum class SynchronizationSchema { LINK_SYNC_V1_RELIABLE, LINK_SYNC_V1_IMMEDIATE_ACK }
@@ -403,7 +406,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
         if(detectOnIdle&&firstByteTimeoutMs>0)handshakeDeadline.schedule({
             if(closed.get()||firstByteSeen||handshakeComplete())return@schedule
             if(!idleDetectSent.compareAndSet(false,true))return@schedule
-            log("iAP first-byte deadline "+firstByteTimeoutMs+"ms; sending Detect")
+            log("iAP peer silent at DETECT: no detect RX in "+firstByteTimeoutMs+"ms (car-side iAP service not ready); sending Detect")
             runCatching{synchronized(writeLock){output.write(IapWire.detection);output.flush()}}
                 .onFailure{log("iAP Detect write failed: "+it.javaClass.simpleName+" "+(it.message?:""))}
         },firstByteTimeoutMs.toLong(),TimeUnit.MILLISECONDS)
