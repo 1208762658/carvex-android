@@ -290,14 +290,10 @@ object Bootstrap {
                         }
                         activeOutbound.set(null)
                         if(isActive&&!stopping.get()){
-                            // 20003/20003.1/20003.2 三份日志同一个结论：一条会话断掉之后，
-                            // 直接重连会在 100–600ms 内抛 read ret:-1（connect 内部就被拒），
-                            // 中间隔到 86 秒也一样；只有把手机蓝牙关掉再开，车机才会清掉旧链路。
-                            // 这里只"领取"一次重置并交给独立 scope 执行：attempt 必须立刻失败返回，
-                            // 否则会撞上外层 65s 的 withTimeout，把正在进行的重置整个取消、
-                            // 蓝牙留在 OFF。重置完成后由 SessionController 的 2s 重试循环接上。
-                            if(!winner.isCompleted&&BluetoothSoftReset.claimAfterFailure{log(it)})
-                                BluetoothSoftReset.launchReset(adapter){log(it)}
+                            // 这里只把失败交回上层。失败计数与重置由 SessionController 按
+                            // "一次 attempt = 一次失败"统一处理：出站失败和"连上之后立刻 EOF"
+                            // 是同一种后果（车机侧还挂着上一条链路），必须一起计数，
+                            // 否则 20008.1 那种 RECORD 后 65ms 断链永远触发不到重置。
                             failed("outbound",last?:java.io.IOException("No outbound RFCOMM candidate"))
                         }
                     }

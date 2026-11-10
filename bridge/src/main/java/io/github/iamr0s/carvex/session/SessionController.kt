@@ -33,6 +33,11 @@ private const val SPLASH_MILLIS=1_500L
 
 private const val MIN_BITRATE=1_000_000
 
+/** 连续这么多次 attempt 失败就停止重试。
+ *  20008.1：54 秒内 9 次尝试把 866F 打到卡死重启，其中 6 次 peer matched 后立刻 EOF。
+ *  退避到 30 秒后 5 次仍然全败，说明继续试只是继续打车机，而不是"再多一次机会就会成"。 */
+private const val FAIL_STREAK_LIMIT=5
+
 /** 按像素率估算码率：约 0.13 bit/像素/帧，最低 1 Mbps。
  *  例：1080p30≈8.1 Mbps、720p30≈3.6 Mbps、1080p60≈16.2 Mbps。 */
 private fun nominalBitrate(width:Int,height:Int,fps:Int):Int {
@@ -84,6 +89,8 @@ class SessionController(
         if(adapter==null||!adapter.isEnabled){reject("蓝牙未开启：请先在系统设置中打开蓝牙，再回到本页连接");return}
         job=scope.launch {
             var attempt=0
+            // 连续失败计数：达到上限就停手。车机侧被反复握手打崩的代价远大于我们多试几次。
+            var consecutiveFailures=0
             while(isActive){
                 // 自动重置蓝牙那 40 秒里不要空转：每一轮都会在 OFF 状态下打一份完整的失败日志，
                 // 还会和 reset 抢同一个适配器。这里只等，等重置收尾后立刻继续连。
@@ -126,7 +133,27 @@ class SessionController(
                         break
                     }
                     BridgeStore.update(id){it.copy(stage=Stage.RETRY,detail="资源已释放，等待恢复连接",error=BridgeStore.redact(t.message?:"连接中断"))}
-                    delay(options.retryIntervalSeconds*1000L)
+                    // 20008.1 的现场：10:27:38 RECORD 后 65ms 断链，随后 54 秒里我们发起了 9 次尝试、
+                    // 其中 6 次 peer matched 后立刻 EOF —— 车机被这串握手打崩重启。
+                    // 所以重试绝不能固定 2 秒：失败按次数退避，连续多次就收手，等用户手动。
+                    consecutiveFailures++
+                    if(consecutiveFailures>=FAIL_STREAK_LIMIT){
+                        BridgeStore.update(id){it.copy(stage=Stage.FAILED,detail="连续 "+consecutiveFailures+" 次连接失败，已暂停重试（避免车机反复握手重启）",
+                            error=BridgeStore.redact(t.message?:t.javaClass.simpleName))}
+                        BridgeStore.log(id,"retry halted after "+consecutiveFailures+" consecutive failures; manual retry required")
+                        break
+                    }
+                    // 一次 attempt 失败算一次。出站失败与"连上之后立刻 EOF"在这里合并计数：
+                    // 车机侧还挂着上一条链路时，这两种形态是同一种后果。连续两次就动手关蓝牙，
+                    // 重置自己会占掉 40 秒，天然把下一轮隔开。
+                    if(BluetoothSoftReset.claimAfterFailure{msg->BridgeStore.log(id,msg)})
+                        adapter?.let{a->BluetoothSoftReset.launchReset(a){BridgeStore.log(id,it)}}
+                    val backoffSec=when(consecutiveFailures){
+                        1->2;2->5;3->10;4->20;else->30
+                    }
+                    val waitSec=maxOf(options.retryIntervalSeconds,backoffSec)
+                    BridgeStore.log(id,"retry backoff: attempt="+consecutiveFailures+" wait="+waitSec+"s")
+                    delay(waitSec*1000L)
                 }
             }
         }
