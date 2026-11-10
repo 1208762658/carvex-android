@@ -813,6 +813,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             else->v.toString()
         }
         log("video SETUP keys="+stream.entries.joinToString(","){it.key+":"+valueType(it.value)})
+        // 逐字段把值也打出来（只有数字/字符串会展开，其余只报类型和长度）。20008.2 里成功与失败的
+        // 两次 bodyBytes 都是 223，但内容从来没有被逐字节核对过；RECORD 之后 46–65 ms 被切断，
+        // 而我们在这段时间里一个报文都没发，所以要么是这个请求里的某个值，要么是车机自己的状态。
+        log("video SETUP values="+stream.entries.sortedBy{it.key.toString()}.joinToString(","){e->
+            val v=e.value
+            e.key+"="+when(v){is Number,is String->v.toString();is ByteArray->"bytes["+v.size+"]";else->valueType(v)}
+        })
         // 四条请求共用会话开始时生成的连接 URL（见 initial SETUP 处的说明）。
         val mediaPath=sessionPath
         val screenReply=try{setupSession.screen(stream)}
@@ -829,6 +836,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // RECORD 没有正文（第 06 章）；发空 plist 会让对端把已配置的流当成无输入。
         // URL 用连接 URL（固件 0x24fda58ec：'recr' 包不设自己的 URL，落到连接 URL
         // `rtsp://<host>/<u64>`），与控制连接同一条会话，不能用 "/"。
+        log("RECORD request body=empty; video socket local="+(video?.localPort)+" remote="+(video?.port)+
+            " closed="+video?.isClosed+" connected="+video?.isConnected)
         setupSession.start()
         // 屏幕流保活帧（第 07 章 §2.6.1）：固件在同一个生产者里发 128 字节明文头、`0x04 = 2`、
         // 无正文；它是屏幕数据口上的独立存活信号，不是视频流量的备份。周期未在固件中还原，取 1 s。

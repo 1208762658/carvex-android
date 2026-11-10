@@ -827,11 +827,9 @@ class SessionController(
                 val receiverFps=activeScreen.fps
                 val hostFpsHint=(format?.getInt("fps") ?: format?.getInt("maxFPS"))?.takeIf{it>0}
                 val limit=minOf(receiverFps,hostFpsHint?:Int.MAX_VALUE)
-                // 车机没给帧率提示（hostFpsHint=null）时，60 完全是我们自己按接收端能力取满的。
-                // 20008.2 的 1f92b6a4 / b7ccf0d8 两次都是"SETUP/RECORD 全 200 -> 46/65 ms 控制连接
-                // 被切断 -> 车机随机整机重启"，最可能是它那边的视频通道吃不下 1354x666@60 这个负载。
-                // 先按更接近 iPhone 原生的档位跑：默认 30fps；carvex.video.fps 可单独回滚。
-                val fpsCap=(System.getProperty("carvex.video.fps")?.trim()?.toIntOrNull() ?: 30).takeIf{it>0}
+                // 默认不干预：按车机协商值走（20008.2 证明 60fps/7.03Mbps 能跑 82/142 秒，值本身没问题）。
+                // 真要压负载时用 carvex.video.fps / carvex.video.maxBitrate 手动指定。
+                val fpsCap=System.getProperty("carvex.video.fps")?.trim()?.toIntOrNull()?.takeIf{it>0}
                 val negotiatedFpsLimit=limit
                 val fpsLimit=if(fpsCap!=null&&fpsCap<negotiatedFpsLimit)fpsCap else negotiatedFpsLimit
                 val supported=VideoEncoder.supportedFps(format)
@@ -853,9 +851,8 @@ class SessionController(
                 val candidates=listOfNotNull(normalizedHint,nominal)
                 var bitrate=candidates.max()
                 bitrate=videoCeiling?.let{bitrate.coerceAtMost(it)} ?: bitrate
-                // 车机也没给码率提示（hostHint=null），7.03 Mbps 是按像素率估出来的。
-                // 和帧率同理：先压到 4 Mbps，carvex.video.maxBitrate 可单独回滚（0 表示不设上限）。
-                val bitrateCap=System.getProperty("carvex.video.maxBitrate")?.trim()?.toIntOrNull() ?: 4_000_000
+                // 同理默认不设上限（0 = 不干预）；需要压时用 carvex.video.maxBitrate 显式指定。
+                val bitrateCap=System.getProperty("carvex.video.maxBitrate")?.trim()?.toIntOrNull() ?: 0
                 if(bitrateCap>0&&bitrate>bitrateCap){
                     BridgeStore.log(id,"Video bitrate capped for receiver: requested="+bitrate+" cap="+bitrateCap)
                     bitrate=bitrateCap
