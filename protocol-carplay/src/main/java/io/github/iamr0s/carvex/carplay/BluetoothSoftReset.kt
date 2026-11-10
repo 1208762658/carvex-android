@@ -31,6 +31,9 @@ import kotlinx.coroutines.launch
 object BluetoothSoftReset {
     /** 触发阈值：同一进程内连续这么多次"全部候选失败"才考虑重置。 */
     private const val FAILURES_BEFORE_RESET=2
+    /** 自动重置总开关，默认关。实测一触发就是"VEX 消失、车机没反应"，必须先由人决定才翻开。 */
+    private val AUTO_RESET_ENABLED=
+        (System.getProperty("carvex.bluetooth.autoReset")?.trim()?.toIntOrNull() ?: 0)!=0
     /** 两次重置之间的最小间隔。 */
     private const val COOLDOWN_MS=90_000L
     /** 关闭后保持多久：>=30s 即可，日志里 30s 与 60s 都成功过。 */
@@ -54,6 +57,14 @@ object BluetoothSoftReset {
         val now=android.os.SystemClock.elapsedRealtime()
         return synchronized(lock){
             consecutiveFailures++
+            // 自动关蓝牙默认关闭：20010/20011 实测它一触发，手机适配器消失、车机端直接没反应，
+            // 表现就是"跑一遍流程然后 VEX 自己不见了"，比不改还差。要重新启用必须显式打开
+            // carvex.bluetooth.autoReset=1，启用后配合 carvex.bluetooth.resetHoldMs 控制关闭时长。
+            if(!AUTO_RESET_ENABLED){
+                if(consecutiveFailures==FAILURES_BEFORE_RESET)
+                    log("bluetooth auto reset: disabled by default (carvex.bluetooth.autoReset=1 to enable); attempts="+consecutiveFailures)
+                return@synchronized false
+            }
             when{
                 privilegedKnown&&!privileged->{
                     log("bluetooth auto reset: skipped (no adapter privilege on this build)")
