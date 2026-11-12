@@ -152,6 +152,52 @@ object Bootstrap {
     }
 
     /**
+     * 冷 ACL 预热。
+     *
+     * 车机的蓝牙可连接性由它自己的 UI 状态决定：配对中（PIN 确认）、配对刚完成
+     * （设备类型选择）时 ACL 是热的，此时 RFCOMM 一把就中；而平时待命状态下它
+     * 根本不响应 page —— 表现就是 35-162ms 的 `read ret:-1` 和 12255ms 的 page 超时。
+     *
+     * 从手机侧唯一能主动做的事，是用一条车机一定监听的 profile 去撞一次 page：
+     * HFP（车机一定作为 HF unit 监听）优先，A2DP 次之。ACL 一旦建立，后续 RFCOMM
+     * 才有复用的机会。连上后立刻断开，只借用链路，不占用车机的音频通道。
+     */
+    private suspend fun warmAcl(context:Context,device:BluetoothDevice,log:(String)->Unit):Boolean{
+        val manager=context.getSystemService(BluetoothManager::class.java)?:return false
+        val adapter=manager.adapter?:return false
+        for(profile in listOf(BluetoothProfile.HEADSET,BluetoothProfile.A2DP)){
+            if(manager.getConnectionState(device,profile)==BluetoothProfile.STATE_CONNECTED){
+                log("ACL warmup profile=$profile already connected")
+                return true
+            }
+            val proxy=withTimeoutOrNull(2_000){
+                suspendCancellableCoroutine<BluetoothProfile?>{cont->
+                    runCatching{
+                        adapter.getProfileProxy(context,object:BluetoothProfile.ServiceListener{
+                            override fun onServiceConnected(p:Int,pro:BluetoothProfile?){if(cont.isActive)cont.resume(pro)}
+                            override fun onServiceDisconnected(p:Int){}
+                        },profile)
+                    }.onFailure{if(cont.isActive)cont.resume(null)}
+                }
+            }
+            if(proxy==null){log("ACL warmup profile=$profile proxy unavailable");continue}
+            val connected=runCatching{
+                proxy.javaClass.getMethod("connect",BluetoothDevice::class.java).invoke(proxy,device) as? Boolean ?:false
+            }.getOrDefault(false)
+            log("ACL warmup profile=$profile connect=$connected")
+            if(connected){
+                delay(1_500)
+                runCatching{proxy.javaClass.getMethod("disconnect",BluetoothDevice::class.java).invoke(proxy,device)}
+                runCatching{adapter.closeProfileProxy(profile,proxy)}
+                log("ACL warmup done via profile=$profile; ACL now warm")
+                return true
+            }
+            runCatching{adapter.closeProfileProxy(profile,proxy)}
+        }
+        return false
+    }
+
+    /**
      * 按通道号直接创建 RFCOMM socket，跳过 SDP 查询（隐藏 API）。
      *
      * `createRfcommSocketToServiceRecord(uuid)` 内部要先在 SDP 记录里查出该 UUID 的
@@ -368,6 +414,8 @@ object Bootstrap {
                         // 35–162ms 失败或 page 超时。因此失败后不立刻放弃，而是在窗口期内低频
                         // 反复拨号：用户点车机的那一刻，下一轮探测就能抓住。
                         if(isActive&&!stopping.get()&&!winner.isCompleted){
+                            // 探测前先把 ACL 撞热：冷态下每一轮探测都只会重演同一个失败。
+                            warmAcl(context,device,log)
                             val windowUntil=android.os.SystemClock.elapsedRealtime()+20_000L
                             var round=0
                             while(isActive&&!stopping.get()&&!winner.isCompleted&&
