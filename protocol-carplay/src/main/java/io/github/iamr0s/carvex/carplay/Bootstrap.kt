@@ -3,7 +3,10 @@ import io.github.iamr0s.carvex.sessioncore.*
 
 import android.annotation.SuppressLint
 import android.bluetooth.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.*
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
@@ -111,6 +114,43 @@ object Bootstrap {
     /** After the Wi-Fi configuration arrives, how long a still-missing 0x5703 announcement is awaited. */
     private const val ANNOUNCEMENT_WAIT_MS=30_000L
     @SuppressLint("MissingPermission")
+    /**
+     * 真正向车机查一次 SDP 记录，而不是读平台配对缓存。
+     *
+     * `device.uuids` 是**本地缓存**：配对时存下，之后车机撤掉记录它也照样显示。所以
+     * RFCOMM 报 `peer-rejected` 时无法回答"这条通道到底存不存在"。这里主动
+     * `fetchUuidsWithSdp()` 并等 `ACTION_UUID`，拿车机当前的答案。
+     *
+     * 上限 2.5 秒：查不到就返回空表，绝不拖慢会话启动；车机在连接被拒时通常几秒内就回。
+     */
+    suspend fun sdpUuids(context:Context,device:BluetoothDevice,log:(String)->Unit):List<java.util.UUID>{
+        val deadline=2_500L
+        return withTimeoutOrNull(deadline){
+            suspendCancellableCoroutine{cont->
+                var done=false
+                fun finish(result:List<java.util.UUID>){
+                    if(done)return;done=true
+                    if(cont.isActive)cont.resume(result)
+                }
+                val receiver=object:BroadcastReceiver(){
+                    override fun onReceive(c:Context?,i:Intent?){
+                        if(i?.action!=BluetoothDevice.ACTION_UUID)return
+                        val extra=@Suppress("DEPRECATION") i.getParcelableArrayExtra(BluetoothDevice.EXTRA_UUID)
+                        val list=extra?.mapNotNull{(it as? android.os.ParcelUuid)?.uuid}?.distinct()?:emptyList()
+                        runCatching{context.unregisterReceiver(this)}
+                        finish(list)
+                    }
+                }
+                val flags=if(Build.VERSION.SDK_INT>=33)Context.RECEIVER_NOT_EXPORTED else 0
+                runCatching{context.registerReceiver(receiver,IntentFilter(BluetoothDevice.ACTION_UUID),flags)}
+                    .onFailure{log("Bluetooth SDP query unavailable: "+(it.message?:it.javaClass.simpleName));finish(emptyList())}
+                val started=device.fetchUuidsWithSdp()
+                if(!started){runCatching{context.unregisterReceiver(receiver)};finish(emptyList())}
+                cont.invokeOnCancellation{runCatching{context.unregisterReceiver(receiver)}}
+            }
+        }?.takeIf{it.isNotEmpty()}?:emptyList()
+    }
+
     fun devices(context:Context):List<Device> {
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:return emptyList()
         return adapter.bondedDevices.map{Device(it.name?:"未命名设备",it.address)}.sortedBy{it.name}
@@ -150,6 +190,11 @@ object Bootstrap {
             " uuidCount="+servicePlan.cachedUuidCount+" freshness=unverified fullSdp=unavailable")
         // 对端要按 UUID/SCN 对齐通道，只给数量不够，把平台缓存里的 UUID 原文打出来。
         log("Bluetooth cached UUIDs: "+(device.uuids?.map{it.uuid.toString()}?.distinct()?.joinToString(",") ?: "<none>"))
+        // 缓存不等于车机的 SDP 记录：配对时见过一次，之后车机可能已经把那条记录撤了。
+        // RFCOMM 报 peer-rejected 时，只有真实 SDP 结果能分清"通道不存在"与"通道存在但对端拒绝"。
+        val sdpUuids=sdpUuids(context,device,log)
+        log("Bluetooth SDP uuids="+(sdpUuids.joinToString(",")?.ifEmpty{"<none>"}?:"<unavailable>")+
+            " carPlayCaff="+sdpUuids.any{it.toString()=="00000000-deca-fade-deca-deafdecacaff"})
         return coroutineScope {
             // 只注册普通手机 WiAP 角色；Sink 是固件的替代角色，不是额外兼容监听。
             // 公共 SDK 的两个 listener 仍是独立 channel，也不能自定义 SDP profile 属性。

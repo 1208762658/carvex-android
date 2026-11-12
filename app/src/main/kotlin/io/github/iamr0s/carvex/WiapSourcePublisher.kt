@@ -105,7 +105,7 @@ object WiapSourcePublisher {
             return
         }
         if (!Permissions.granted(context)) {
-            BridgeStore.log("", "Persistent WiAP source inactive: required permissions missing")
+            BridgeStore.log("", "Persistent WiAP source inactive: required permissions missing (" + Permissions.missing(context).joinToString(",") + ")")
             return
         }
         if (legacySocket == null) {
