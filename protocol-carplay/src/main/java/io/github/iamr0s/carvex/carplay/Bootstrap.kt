@@ -364,7 +364,16 @@ object Bootstrap {
                         // 不是车机拒绝连接——createRfcommSocketToServiceRecord 必须先拿到
                         // SDP 里的 channel，而 866F 对纯 SDP 查询不回包（11 次全 <none>）。
                         // createRfcommSocket(channel) 只做 L2CAP 拨号，不发 SDP，因此能绕开。
+                        // 车机只在用户点过 CarPlay 之后才开放蓝牙连接窗口，在此之前的探测必然
+                        // 35–162ms 失败或 page 超时。因此失败后不立刻放弃，而是在窗口期内低频
+                        // 反复拨号：用户点车机的那一刻，下一轮探测就能抓住。
                         if(isActive&&!stopping.get()&&!winner.isCompleted){
+                            val windowUntil=android.os.SystemClock.elapsedRealtime()+20_000L
+                            var round=0
+                            while(isActive&&!stopping.get()&&!winner.isCompleted&&
+                                android.os.SystemClock.elapsedRealtime()<windowUntil){
+                                round++
+                                log("RFCOMM window probe round=$round (car opens the window only after the driver taps CarPlay)")
                             for(channel in 1..6){
                                 if(!isActive||stopping.get()||winner.isCompleted)break
                                 val raw=rawRfcommSocket(device,channel)
@@ -390,6 +399,10 @@ object Bootstrap {
                                     last=t
                                 }
                                 delay(600)
+                                if(winner.isCompleted)break
+                            }
+                                if(!isActive||stopping.get()||winner.isCompleted)break
+                                delay(1_000)
                             }
                         }
                         activeOutbound.set(null)
