@@ -192,9 +192,14 @@ object Bootstrap {
         log("Bluetooth cached UUIDs: "+(device.uuids?.map{it.uuid.toString()}?.distinct()?.joinToString(",") ?: "<none>"))
         // 缓存不等于车机的 SDP 记录：配对时见过一次，之后车机可能已经把那条记录撤了。
         // RFCOMM 报 peer-rejected 时，只有真实 SDP 结果能分清"通道不存在"与"通道存在但对端拒绝"。
-        val sdpUuids=sdpUuids(context,device,log)
-        log("Bluetooth SDP uuids="+(sdpUuids.joinToString(",")?.ifEmpty{"<none>"}?:"<unavailable>")+
-            " carPlayCaff="+sdpUuids.any{it.toString()=="00000000-deca-fade-deca-deafdecacaff"})
+        // 必须放后台：0.3 日志里 11 次 SDP 查询全部吃满 2.5 秒上限且返回 <none>，
+        // 其中 5 次随后 RFCOMM 照样连上——说明 866F 不回纯 SDP 查询，但会为 RFCOMM 建 ACL。
+        // 同步等待等于每次连接白扔 2.5 秒，因此只作为旁路证据，不进入关键路径。
+        kotlinx.coroutines.CoroutineScope(SupervisorJob()+Dispatchers.IO).launch{
+            val sdpUuids=sdpUuids(context,device,log)
+            log("Bluetooth SDP uuids="+(sdpUuids.joinToString(",").ifEmpty{"<none>"})+
+                " carPlayCaff="+sdpUuids.any{it.toString()=="00000000-deca-fade-deca-deafdecacaff"})
+        }
         return coroutineScope {
             // 只注册普通手机 WiAP 角色；Sink 是固件的替代角色，不是额外兼容监听。
             // 公共 SDK 的两个 listener 仍是独立 channel，也不能自定义 SDP profile 属性。
@@ -301,8 +306,12 @@ object Bootstrap {
                         // 成功那次握手 5.79s。所以出站前先等"栈就绪"；超时也放行，只记录不阻断。
                         BluetoothReadyGate.awaitReady(adapter,device,BluetoothReadyGate.READY_TIMEOUT_MS){log(it)}
                         var last:Exception?=null
+                        var attemptIndex=0
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch
+                            // 0.3 日志：phone 失败后只隔 78–162ms 就敲 phone-v2，两次同样
+                            // 抛 read ret:-1。车机来不及释放上一条 ACL，第二次等于撞在残骸上。
+                            if(attemptIndex++>0)delay(1_500)
                             val direction=candidate.service.outboundLabel
                             val uuid=candidate.service.remoteUuid
                             val socket=try{
