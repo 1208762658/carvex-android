@@ -152,8 +152,12 @@ class SessionController(
                     // 重置自己会占掉 40 秒，天然把下一轮隔开。
                     if(BluetoothSoftReset.claimAfterFailure{msg->BridgeStore.log(id,msg)})
                         adapter?.let{a->BluetoothSoftReset.launchReset(a){BridgeStore.log(id,it)}}
+                    // 外部分析给出 MIB3 的 mediaDisconnectTimeout=15000ms：车机判定设备移除、释放会话
+                    // 之前，短间隔重试会不断续上它的清理计时器。前两次重试因此压到 15 秒，不再在窗口内敲。
+                    // 注意这是**必要不充分**条件：实测有一次隔 86 秒（远超窗口）仍全败，说明拉长间隔
+                    // 单独不能解决；但它零风险，且能排除"重试污染"这一变量，便于归因。
                     val backoffSec=when(consecutiveFailures){
-                        1->2;2->5;3->10;4->20;else->30
+                        1->15;2->15;3->20;4->30;else->30
                     }
                     // RECORD 刚过就 EOF：对端在"准备收视频"那一刻把控制连接关掉，20008.2 里这种
                     // 形态后面紧跟着车机整机重启。把它当成对端崩溃，而不是普通断链 —— 多留一段时间，
