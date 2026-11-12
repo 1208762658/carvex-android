@@ -151,6 +151,20 @@ object Bootstrap {
         }?.takeIf{it.isNotEmpty()}?:emptyList()
     }
 
+    /**
+     * 按通道号直接创建 RFCOMM socket，跳过 SDP 查询（隐藏 API）。
+     *
+     * `createRfcommSocketToServiceRecord(uuid)` 内部要先在 SDP 记录里查出该 UUID 的
+     * channel；866F 不回纯 SDP 查询，这一步失败就会在几十毫秒内抛 `read ret:-1`，
+     * 表现成"车机拒绝连接"，其实是本地拿不到 channel。直接给 channel 就没有这个依赖。
+     *
+     * 反射失败（隐藏 API 被策略拦截）时返回 null，由调用方跳过，不影响原有路径。
+     */
+    private fun rawRfcommSocket(device:BluetoothDevice,channel:Int):BluetoothSocket?=runCatching{
+        BluetoothDevice::class.java.getMethod("createRfcommSocket",Int::class.javaPrimitiveType)
+            .invoke(device,channel) as BluetoothSocket
+    }.getOrNull()
+
     fun devices(context:Context):List<Device> {
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:return emptyList()
         return adapter.bondedDevices.map{Device(it.name?:"未命名设备",it.address)}.sortedBy{it.name}
@@ -342,6 +356,40 @@ object Bootstrap {
                                 if(isActive&&!stopping.get())log("RFCOMM $direction failed before iAP: "+t.javaClass.simpleName+
                                     " "+(t.message?:"")+"; SDP record absence not established elapsedMs=$elapsedMs fingerprint="+
                                     BluetoothReadyGate.classify(elapsedMs,t,adapter))
+                            }
+                        }
+                        // UUID 探测全败后，用隐藏 API 按通道号直接拨，绕过 SDP。
+                        // 0.3 日志：11/14 次失败在 35-162ms 就抛 read ret:-1，而同一时刻
+                        // device.uuids 仍列出 deafdecacaff。失败的这一步是 SDP 记录解析/查询，
+                        // 不是车机拒绝连接——createRfcommSocketToServiceRecord 必须先拿到
+                        // SDP 里的 channel，而 866F 对纯 SDP 查询不回包（11 次全 <none>）。
+                        // createRfcommSocket(channel) 只做 L2CAP 拨号，不发 SDP，因此能绕开。
+                        if(isActive&&!stopping.get()&&!winner.isCompleted){
+                            for(channel in 1..6){
+                                if(!isActive||stopping.get()||winner.isCompleted)break
+                                val raw=rawRfcommSocket(device,channel)
+                                if(raw==null){
+                                    log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
+                                    continue
+                                }
+                                r.own(raw);activeOutbound.set(raw)
+                                val startedAt=android.os.SystemClock.elapsedRealtime()
+                                log("RFCOMM raw channel=$channel attempt (SDP bypass)")
+                                trace("tx","channel$channel","attempt","RAW_CHANNEL")
+                                try{
+                                    raw.connect()
+                                    if(!isActive||stopping.get()){r.release(raw);break}
+                                    log("RFCOMM raw channel=$channel connected without SDP")
+                                    select(raw,"channel$channel");return@launch
+                                }catch(t:Exception){
+                                    activeOutbound.compareAndSet(raw,null)
+                                    if(winnerSocket.get()!==raw)r.release(raw)
+                                    if(t is CancellationException)throw t
+                                    val el=android.os.SystemClock.elapsedRealtime()-startedAt
+                                    log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
+                                    last=t
+                                }
+                                delay(600)
                             }
                         }
                         activeOutbound.set(null)
