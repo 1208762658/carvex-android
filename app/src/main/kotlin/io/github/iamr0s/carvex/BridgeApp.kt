@@ -36,8 +36,6 @@ object Permissions {
     /** 连接真正依赖的权限：缺任何一项都不该继续。 */
     fun required()=buildList {
         if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_CONNECT)
-        if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_SCAN)
-        if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_ADVERTISE)
         if(Build.VERSION.SDK_INT>=33)add(Manifest.permission.NEARBY_WIFI_DEVICES)
         else {add(Manifest.permission.ACCESS_COARSE_LOCATION);add(Manifest.permission.ACCESS_FINE_LOCATION)}
         // API 37 asks for local network access separately. Only from that version on counts: an
@@ -49,6 +47,10 @@ object Permissions {
      *  看不到配对与连接的状态，所以放在同一个入口一起要。 */
     fun optional()=buildList {
         if(Build.VERSION.SDK_INT>=33)add(Manifest.permission.POST_NOTIFICATIONS)
+        // SCAN/ADVERTISE 只服务 BLE 拓扑观测，绝不能进 required：缺它们时整条 WiAP
+        // 发布会被判"权限缺失"直接不启动，连接会彻底断掉。
+        if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_SCAN)
+        if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_ADVERTISE)
     }.toTypedArray()
     /** 要申请的完整清单：阻塞性的在前，可选的在后。 */
     fun requested()=required()+optional()

@@ -89,6 +89,8 @@ object WiapSourcePublisher {
         BluetoothRoleGate.persistentSourceActive = { active() }
         BluetoothRoleGate.takePendingInbound = { takePending() }
         BridgeStore.log("", "Persistent WiAP source publisher started; waiting for Bluetooth")
+        // BLE 拓扑观测挂在常驻入口：会话只有几秒，扫描/广播必须跨会话跑才能判阴性。
+        runCatching { BleTopologyProbe.start(app) }
         ensureActive(app)
     }
 
