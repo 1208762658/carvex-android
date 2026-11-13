@@ -1277,6 +1277,19 @@ object Bootstrap {
                     val lb=it.address;val pb=peer.address
                     lb.size==4&&pb.size==4&&lb[0]==pb[0]&&lb[1]==pb[1]&&lb[2]==pb[2]
                 }
+                // 5703 给的 SSID 带 " 5 GHz" 后缀（VW 把两个频段拆成两个名字），而手机连上的
+                // 往往是同一个 AP 的另一个名字。只做严格相等会把"已经连着"判成"没连"。
+                fun baseSsid(x:String?):String=(x?:"").trim('"')
+                    .replace(Regex("\\s*5\\s*GHz.*$",RegexOption.IGNORE_CASE),"")
+                    .replace(Regex("\\s*5G$",RegexOption.IGNORE_CASE),"")
+                    .trim().lowercase()
+                val ssidBasesMatch=!current.isNullOrEmpty()&&b.ssid.isNotEmpty()&&
+                    baseSsid(current)==baseSsid(b.ssid)
+                // 车机热点网段固定 10.173.189.0/24（成功会话里手机是 10.173.189.60）。
+                // 本机 IPv4 就在这个网段，等于"已经在车机热点上"，与 SSID 怎么命名无关。
+                val onCarSubnet=localV4.any{it.hostAddress?.let{h->h.startsWith("10.173.189.")}==true}
+                if(localV4.isNotEmpty())log("Wi-Fi local IPv4="+localV4.joinToString(","){it.hostAddress?:"?"}+
+                    " onCarSubnet="+onCarSubnet+" expectedBase="+baseSsid(b.ssid)+" currentBase="+baseSsid(current))
                 val ssidMatches=!current.isNullOrEmpty()&&current==b.ssid
                 // 5703 只给 SSID/密码/channel，不给 IP（endpointReady=false），所以 sameSubnetV4 在
                 // 这条路径上永远不成立；而 WifiInfo.ssid 读不到时（无 NEARBY_WIFI_DEVICES/定位授权）
@@ -1286,10 +1299,12 @@ object Bootstrap {
                 if(!ssidMatches&&!sameSubnetV4)
                     log("Wi-Fi reuse miss: expectedSsid="+b.ssid+" currentSsid="+(current?:"<unknown>")+
                         " endpointUnknown="+(b.endpoint==null)+" localV4="+localV4.size)
-                val reusable=ssidMatches||sameSubnetV4||(ssidUnknown&&localV4.isNotEmpty()&&b.endpoint==null)
+                val reusable=ssidMatches||ssidBasesMatch||onCarSubnet||sameSubnetV4||
+                    (ssidUnknown&&localV4.isNotEmpty()&&b.endpoint==null)
                 if(reusable&&properties!=null&&
                     NetworkLinkReadiness.isReady(properties.interfaceName,properties.linkAddresses.map{it.address})){
-                    log("Wi-Fi lease reusable: ssidMatch="+ssidMatches+" sameSubnetV4="+sameSubnetV4+
+                    log("Wi-Fi lease reusable: ssidMatch="+ssidMatches+" ssidBasesMatch="+ssidBasesMatch+
+                        " onCarSubnet="+onCarSubnet+" sameSubnetV4="+sameSubnetV4+
                         " ssidUnknown="+ssidUnknown+" ssid="+(current?:"<unknown>"))
                     val monitoring=java.util.concurrent.atomic.AtomicBoolean(true)
                     val monitor=object:ConnectivityManager.NetworkCallback(){
