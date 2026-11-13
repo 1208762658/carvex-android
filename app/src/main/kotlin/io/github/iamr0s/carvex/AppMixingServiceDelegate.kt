@@ -36,8 +36,22 @@ internal class AppMixingServiceDelegate(private val service: Service) : MixingSe
 
     override val session = object : MixingServiceSession {
         override val active: Boolean get() = controller.active
+        // 宿主（CW）靠这条 Flow 判断会话该不该继续：一旦看到 failed=true 就会收掉投屏，
+        // 我们也就同时失去画面源和连接窗口。但 CarVeX 的失败绝大多数是可重试的——
+        // 车机待命不响应 page、栈未就绪、channel 被拒，这些下一轮就有可能成功。
+        // 所以这里只把"必须由用户处理"的失败放出去（权限、未配对、连续失败熔断），
+        // 其余重试期间一律报"连接中"，让 CW 保持会话，把窗口留给车机回连。
         override val status = BridgeStore.state.map { state ->
-            MixingSessionStatus(state.progressText.ifBlank { state.stage.title }, state.stage == Stage.FAILED)
+            val mustAskUser = state.stage == Stage.FAILED &&
+                (state.error.orEmpty().contains("权限") ||
+                    state.error.orEmpty().contains("配对") ||
+                    state.detail.contains("已暂停重试"))
+            val text = when {
+                state.stage == Stage.RETRY -> (state.detail.ifBlank { "正在连接车机" })
+                state.stage == Stage.FAILED && !mustAskUser -> "正在连接车机（自动重试中）"
+                else -> state.progressText.ifBlank { state.stage.title }
+            }
+            MixingSessionStatus(text, mustAskUser)
         }
 
         override suspend fun start(fromHost: Boolean) {
