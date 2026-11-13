@@ -156,8 +156,17 @@ class SessionController(
                     // 之前，短间隔重试会不断续上它的清理计时器。前两次重试因此压到 15 秒，不再在窗口内敲。
                     // 注意这是**必要不充分**条件：实测有一次隔 86 秒（远超窗口）仍全败，说明拉长间隔
                     // 单独不能解决；但它零风险，且能排除"重试污染"这一变量，便于归因。
+                    // DETECT 阶段失败（车机在 iAP 服务就绪前把 RFCOMM 直接关掉）不适用
+                    // 15 秒窗口：那时还没进媒体，车机没有 mediaDisconnectTimeout 计时器，
+                    // 而 2026-11-13 的 2.0 日志里两次都是"启动→1200ms 探测→车机断链"，
+                    // 15 秒退避等于把整个连接窗口让给车机。这里给 3 次 2 秒的快速重连，
+                    // 之后回落到原有节奏，仍受 FAIL_STREAK_LIMIT 约束。
+                    val detectStage=stageAtFailure==Stage.DETECT
                     val backoffSec=when(consecutiveFailures){
-                        1->15;2->15;3->20;4->30;else->30
+                        1->if(detectStage)2 else 15
+                        2->if(detectStage)2 else 15
+                        3->if(detectStage)3 else 20
+                        4->30;else->30
                     }
                     // RECORD 刚过就 EOF：对端在"准备收视频"那一刻把控制连接关掉，20008.2 里这种
                     // 形态后面紧跟着车机整机重启。把它当成对端崩溃，而不是普通断链 —— 多留一段时间，
