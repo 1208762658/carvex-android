@@ -1266,9 +1266,19 @@ object Bootstrap {
                     lb.size==4&&pb.size==4&&lb[0]==pb[0]&&lb[1]==pb[1]&&lb[2]==pb[2]
                 }
                 val ssidMatches=!current.isNullOrEmpty()&&current==b.ssid
-                if((ssidMatches||sameSubnetV4)&&properties!=null&&
+                // 5703 只给 SSID/密码/channel，不给 IP（endpointReady=false），所以 sameSubnetV4 在
+                // 这条路径上永远不成立；而 WifiInfo.ssid 读不到时（无 NEARBY_WIFI_DEVICES/定位授权）
+                // 我们也无从证伪"用户已经手动连上了车机热点"。这两种情况都按"已在热点上"处理，
+                // 先复用现有 lease；真的连错网时，后续 Bonjour 找不到会照常超时失败，不会更差。
+                val ssidUnknown=current.isNullOrEmpty()
+                if(!ssidMatches&&!sameSubnetV4)
+                    log("Wi-Fi reuse miss: expectedSsid="+b.ssid+" currentSsid="+(current?:"<unknown>")+
+                        " endpointUnknown="+(b.endpoint==null)+" localV4="+localV4.size)
+                val reusable=ssidMatches||sameSubnetV4||(ssidUnknown&&localV4.isNotEmpty()&&b.endpoint==null)
+                if(reusable&&properties!=null&&
                     NetworkLinkReadiness.isReady(properties.interfaceName,properties.linkAddresses.map{it.address})){
-                    log("Wi-Fi lease reusable: ssidMatch="+ssidMatches+" sameSubnetV4="+sameSubnetV4+" ssid="+(current?:"<unknown>"))
+                    log("Wi-Fi lease reusable: ssidMatch="+ssidMatches+" sameSubnetV4="+sameSubnetV4+
+                        " ssidUnknown="+ssidUnknown+" ssid="+(current?:"<unknown>"))
                     val monitoring=java.util.concurrent.atomic.AtomicBoolean(true)
                     val monitor=object:ConnectivityManager.NetworkCallback(){
                         override fun onLost(network:Network){if(monitoring.get()&&!stopped.get()&&network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))}
@@ -1351,16 +1361,18 @@ object Bootstrap {
         if(stopped.get())registration.close()
         registration.start()
         // Android 的 WifiNetworkSpecifier 在"扫不到该 SSID"时要挂满 ~29s 才回调 onUnavailable。
-        // 成功会话里 L2 起链只要 1.03s（12:33:41.773 Wi-Fi callbacks ready），29s 全是白等，
-        // 而且这段等待期间车机的残留会话还在老化。12s 判死，余量是正常路径的 11 倍。
+        // 成功会话里 L2 起链只要 1.03s，29s 全是白等；但 866F 的 AP 不是即开即用的：
+        // 5703 networkReady=true 之后车机才去起热点，实测 12s 判死会误杀（13:29 会话 iAP
+        // 全部走通、5703 已拿到 VWBBBC 5GHz channel=153，却因热点尚未广播被 12s 掐断）。
+        // AMCar 侧记录的 866F 耐心是 19.2s，其 join 超时取 25s；这里对齐到 25s。
         val joinWatchdog=java.util.concurrent.Executors.newSingleThreadScheduledExecutor{r->Thread(r,"wifi-join-watchdog").also{it.isDaemon=true}}
         joinWatchdog.schedule({
             if(!stopped.get()&&!completion.get()){
-                log("Wi-Fi join timed out after 12000ms: SSID="+b.ssid+" not advertised; car-side hotspot is off, retry will not help until it comes back")
-                reject(java.io.IOException("Wi-Fi join timed out after 12000ms: SSID="+b.ssid+" not advertised (car-side hotspot off)"))
+                log("Wi-Fi join timed out after 25000ms: SSID="+b.ssid+" still not advertised; car-side hotspot never came up (5703 said networkReady=true, so this is the AP side, not the phone)")
+                reject(java.io.IOException("Wi-Fi join timed out after 25000ms: SSID="+b.ssid+" not advertised (car-side hotspot never came up)"))
                 registration.close()
             }
-        },12,java.util.concurrent.TimeUnit.SECONDS)
+        },25,java.util.concurrent.TimeUnit.SECONDS)
         r.own(AutoCloseable{joinWatchdog.shutdownNow()})
     }
     fun address(properties:LinkProperties,text:String):InetAddress {
