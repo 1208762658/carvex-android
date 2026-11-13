@@ -165,12 +165,12 @@ object Bootstrap {
     private suspend fun warmAcl(context:Context,device:BluetoothDevice,log:(String)->Unit):Boolean{
         val manager=context.getSystemService(BluetoothManager::class.java)?:return false
         val adapter=manager.adapter?:return false
-        for(profile in listOf(BluetoothProfile.HEADSET,BluetoothProfile.A2DP)){
+        for(profile in listOf(BluetoothProfile.HEADSET)){
             if(manager.getConnectionState(device,profile)==BluetoothProfile.STATE_CONNECTED){
                 log("ACL warmup profile=$profile already connected")
                 return true
             }
-            val proxy=withTimeoutOrNull(2_000){
+            val proxy=withTimeoutOrNull(800){
                 suspendCancellableCoroutine<BluetoothProfile?>{cont->
                     runCatching{
                         adapter.getProfileProxy(context,object:BluetoothProfile.ServiceListener{
@@ -186,7 +186,8 @@ object Bootstrap {
             }.getOrDefault(false)
             log("ACL warmup profile=$profile connect=$connected")
             if(connected){
-                delay(1_500)
+                // 只借链路：page 一响 ACL 就起来了，不需要等 HFP 真正完成服务协商。
+                delay(600)
                 runCatching{proxy.javaClass.getMethod("disconnect",BluetoothDevice::class.java).invoke(proxy,device)}
                 runCatching{adapter.closeProfileProxy(profile,proxy)}
                 log("ACL warmup done via profile=$profile; ACL now warm")
@@ -367,6 +368,10 @@ object Bootstrap {
                         BluetoothReadyGate.awaitReady(adapter,device,BluetoothReadyGate.READY_TIMEOUT_MS){log(it)}
                         var last:Exception?=null
                         var attemptIndex=0
+                        // 预热并发跑，绝不挡住探测：0.7 里每次探测都被拖到 5 秒超时，
+                        // 说明车机侧根本没在响应 page；同步预热只会把本来就短的预算再
+                        // 吃掉一两秒，v30 那次"拉不起 vex"就是这个后果。
+                        val warmJob=launch{runCatching{warmAcl(context,device,log)}}
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch
                             // 0.3 日志：phone 失败后只隔 78–162ms 就敲 phone-v2，两次同样
@@ -413,17 +418,15 @@ object Bootstrap {
                         // 车机只在用户点过 CarPlay 之后才开放蓝牙连接窗口，在此之前的探测必然
                         // 35–162ms 失败或 page 超时。因此失败后不立刻放弃，而是在窗口期内低频
                         // 反复拨号：用户点车机的那一刻，下一轮探测就能抓住。
-                        if(isActive&&!stopping.get()&&!winner.isCompleted){
-                            // 探测前先把 ACL 撞热：冷态下每一轮探测都只会重演同一个失败。
-                            warmAcl(context,device,log)
+                        if(!stopping.get()&&!winner.isCompleted){
                             val windowUntil=android.os.SystemClock.elapsedRealtime()+20_000L
                             var round=0
-                            while(isActive&&!stopping.get()&&!winner.isCompleted&&
+                            while(!stopping.get()&&!winner.isCompleted&&
                                 android.os.SystemClock.elapsedRealtime()<windowUntil){
                                 round++
                                 log("RFCOMM window probe round=$round (car opens the window only after the driver taps CarPlay)")
                             for(channel in 1..6){
-                                if(!isActive||stopping.get()||winner.isCompleted)break
+                                if(stopping.get()||winner.isCompleted)break
                                 val raw=rawRfcommSocket(device,channel)
                                 if(raw==null){
                                     log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
@@ -435,7 +438,7 @@ object Bootstrap {
                                 trace("tx","channel$channel","attempt","RAW_CHANNEL")
                                 try{
                                     raw.connect()
-                                    if(!isActive||stopping.get()){r.release(raw);break}
+                                    if(stopping.get()){r.release(raw);break}
                                     log("RFCOMM raw channel=$channel connected without SDP")
                                     select(raw,"channel$channel");return@launch
                                 }catch(t:Exception){
@@ -449,7 +452,7 @@ object Bootstrap {
                                 delay(600)
                                 if(winner.isCompleted)break
                             }
-                                if(!isActive||stopping.get()||winner.isCompleted)break
+                                if(stopping.get()||winner.isCompleted)break
                                 delay(1_000)
                             }
                         }
