@@ -14,11 +14,21 @@ import org.koin.android.ext.koin.androidContext
 class BridgeApp:Application(),MixingServiceOwner{
     override fun createMixingServiceDelegate(service:Service):MixingServiceDelegate = AppMixingServiceDelegate(service)
 
+    private fun processName():String? = if(Build.VERSION.SDK_INT>=28)getProcessName() else null
+
     override fun onCreate(){
         super.onCreate()
         BridgeStore.init(this)
+        // :guard 是纯守护进程，只跑 CarVexGuardService，绝不在这里起第二套发布/会话，
+        // 否则两个进程会各自注册一版 WiAP 记录，互相抢蓝牙。
+        if(processName()?.endsWith(":guard")==true){
+            return
+        }
         // CarWith 一打开就会回收无前台保护的 CarVeX；初始化完日志立刻抬到前台档。
         CarVexForegroundService.ensure(this)
+        // 前台档挡不住 CarWith 的强清理，再独立开一个 :guard 进程做看护：主进程消失后
+        // 它每 5 秒 bind 一次，把进程和前台服务重新拉起来。
+        CarVexGuardService.ensure(this)
         // 连接历史要在任何界面读到它之前装好：首页第一段直接读它的 StateFlow。
         DeviceHistory.init(this)
         // 组装层启动 Koin：协议栈与宿主插件都从这里取；库模块自身不依赖 Koin。
