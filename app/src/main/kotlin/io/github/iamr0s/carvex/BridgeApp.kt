@@ -36,6 +36,7 @@ object Permissions {
     /** 连接真正依赖的权限：缺任何一项都不该继续。 */
     fun required()=buildList {
         if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_CONNECT)
+        if(Build.VERSION.SDK_INT>=31)add(Manifest.permission.BLUETOOTH_SCAN)
         if(Build.VERSION.SDK_INT>=33)add(Manifest.permission.NEARBY_WIFI_DEVICES)
         else {add(Manifest.permission.ACCESS_COARSE_LOCATION);add(Manifest.permission.ACCESS_FINE_LOCATION)}
         // API 37 asks for local network access separately. Only from that version on counts: an

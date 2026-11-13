@@ -152,6 +152,43 @@ object Bootstrap {
     }
 
     /**
+     * BLE 发现诊断。
+     *
+     * 无线 CarPlay 真正的发现阶段在 BLE：车机作为 peripheral 广播，手机扫描到之后才
+     * 主动发起 RFCOMM。CarVeX 目前完全没有这一层（全仓没有 BluetoothLeScanner），
+     * 等于跳过"发现"直接盲连——正好对应车机待命时不响应 page 的现象（35-160ms 秒拒，
+     * 或撞满 5 秒 page 超时）。先只观测：866F 是否在广播、广播里带哪些 service UUID。
+     */
+    private suspend fun bleProbe(context:Context,device:BluetoothDevice,log:(String)->Unit){
+        val adapter=context.getSystemService(BluetoothManager::class.java)?.adapter?:return
+        if(!adapter.isEnabled){log("BLE scan skipped: adapter off");return}
+        val scanner=runCatching{adapter.bluetoothLeScanner}.getOrNull()
+        if(scanner==null){log("BLE scan unavailable (scanner null, missing BLUETOOTH_SCAN?)");return}
+        val target=device.address
+        val hits=java.util.concurrent.atomic.AtomicInteger(0)
+        val cb=object:android.bluetooth.le.ScanCallback(){
+            override fun onScanResult(callbackType:Int,result:android.bluetooth.le.ScanResult){
+                val addr=runCatching{result.device.address}.getOrNull()?:""
+                if(!addr.equals(target,true))return
+                val rec=result.scanRecord
+                val svc=runCatching{rec?.serviceUuids?.joinToString(","){it.toString()}}.getOrNull()
+                val mfr=runCatching{rec?.manufacturerSpecificData?.let{m->
+                    (0 until m.size()).joinToString(","){"0x"+Integer.toHexString(m.keyAt(it))+"="+
+                        runCatching{m.valueAt(it).take(12).joinToString(""){"%02x".format(it)}}.getOrDefault("")}
+                }}.getOrNull()
+                hits.incrementAndGet()
+                log("BLE adv target rssi="+result.rssi+" services="+(svc?:"<none>")+" mfr="+(mfr?:"<none>"))
+            }
+            override fun onScanFailed(errorCode:Int){log("BLE scan failed code=$errorCode")}
+        }
+        log("BLE scan start target="+target)
+        runCatching{scanner.startScan(cb)}.onFailure{log("BLE scan start failed: "+(it.message?:""))}
+        delay(4_000)
+        runCatching{scanner.stopScan(cb)}
+        log("BLE scan done hits="+hits.get())
+    }
+
+    /**
      * 冷 ACL 预热。
      *
      * 车机的蓝牙可连接性由它自己的 UI 状态决定：配对中（PIN 确认）、配对刚完成
@@ -371,6 +408,7 @@ object Bootstrap {
                         // 预热并发跑，绝不挡住探测：0.7 里每次探测都被拖到 5 秒超时，
                         // 说明车机侧根本没在响应 page；同步预热只会把本来就短的预算再
                         // 吃掉一两秒，v30 那次"拉不起 vex"就是这个后果。
+                        val bleJob=launch{runCatching{bleProbe(context,device,log)}}
                         val warmJob=launch{runCatching{warmAcl(context,device,log)}}
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch

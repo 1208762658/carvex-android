@@ -12,6 +12,11 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- BLE 扫描：无线 CarPlay 的发现阶段（车机 BLE 广播 -> 手机发现 -> 手机主动连）。
+         neverForLocation 表示只用于发现外设，不用于推断位置。 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission
         android:name="android.permission.ACCESS_COARSE_LOCATION"
         android:maxSdkVersion="32" />
