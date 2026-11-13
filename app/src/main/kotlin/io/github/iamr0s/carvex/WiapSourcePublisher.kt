@@ -91,6 +91,8 @@ object WiapSourcePublisher {
         BridgeStore.log("", "Persistent WiAP source publisher started; waiting for Bluetooth")
         // BLE 拓扑观测挂在常驻入口：会话只有几秒，扫描/广播必须跨会话跑才能判阴性。
         runCatching { BleTopologyProbe.start(app) }
+        // 车机蓝牙一有活动就扫一轮，抓"刚开机/开门"那个广播窗口。
+        runCatching { BleTopologyProbe.watchCarActivity(app) }
         ensureActive(app)
     }
 

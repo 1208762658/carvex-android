@@ -63,6 +63,11 @@ class ExperimentalHapRecords(private val storage:PairRecordStorage) {
         }
         return null
     }
+    /** 车机侧删掉配对后，本地这条记录就是过期的：它会让 authenticate 走 verify 而不是 setup，
+     *  于是永远卡在验证失败。调用方在 verify 失败时用它把记录清掉，强制下一轮重新 setup。 */
+    @Synchronized fun forget(owner:PairIdentity,receiver:String,pairingId:String) {
+        storage.write(key(owner,receiver,pairingId.toByteArray(Charsets.UTF_8)),null)
+    }
     @Synchronized fun saveVerified(owner:PairIdentity,receiver:String,pairingId:String,peer:PeerIdentity) {
         val id=pairingId.toByteArray(Charsets.UTF_8)
         PairingIdentityBinding.requirePeer(id,null,peer)

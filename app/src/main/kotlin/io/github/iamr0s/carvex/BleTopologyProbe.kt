@@ -16,6 +16,7 @@ import android.bluetooth.le.AdvertisingSetParameters
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
@@ -69,6 +70,7 @@ object BleTopologyProbe {
     )
 
     private val started = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val watchingSince = java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun start(context: Context) {
         if (!started.compareAndSet(false, true)) return
@@ -86,9 +88,7 @@ object BleTopologyProbe {
                     " advertise=" + granted(app, Manifest.permission.BLUETOOTH_ADVERTISE) +
                     " connect=" + granted(app, Manifest.permission.BLUETOOTH_CONNECT)
             )
-            val target = runCatching {
-                BluetoothDevice::class.java.getField("CARPLAY_TARGET").get(null)
-            }.getOrNull()
+            val target: Any? = null
             for (round in 1..ROUNDS) {
                 if (!scope.isActive) break
                 if (!adapter.isEnabled) {
@@ -109,6 +109,43 @@ object BleTopologyProbe {
             }
             log("all rounds done")
         }
+    }
+
+    /**
+     * 车机 ACL 一有动静就扫一轮。
+     *
+     * 开机跑一轮只能测"待命"，而刚开机 / 车门开 / 用户点中控那一瞬才是车机可能广播的
+     * 窗口，手动开 App 往往已经晚了。这里挂 ACL 连接/断开广播：车机 HFP 一接上或一断，
+     * 立刻扫 12 秒，把那个瞬间抓下来。
+     */
+    fun watchCarActivity(context: Context) {
+        if (!watchingSince.compareAndSet(false, true)) return
+        val app = context.applicationContext
+        val filter = android.content.IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+            addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
+        }
+        runCatching {
+            app.registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    val action = intent.action ?: return
+                    val name = runCatching {
+                        (intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE))?.name
+                    }.getOrNull()
+                    log("acl event action=" + action.substringAfterLast('.') + " peer=" + (name ?: "<none>"))
+                    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                    scope.launch {
+                        val manager = app.getSystemService(BluetoothManager::class.java) ?: return@launch
+                        val adapter = manager.adapter ?: return@launch
+                        if (!adapter.isEnabled) return@launch
+                        log("acl-triggered scan start 12000ms")
+                        scanOnce(manager, adapter, null)
+                    }
+                }
+            }, filter)
+            log("car activity watcher armed")
+        }.onFailure { log("car activity watcher failed: " + (it.message ?: "")) }
     }
 
     private fun granted(context: Context, permission: String): Boolean =

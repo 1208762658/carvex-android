@@ -611,10 +611,23 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     val pairingId=metadata.pairingId?.takeIf{it.isNotBlank()}
                         ?: (bootstrap.startSession?.receiver ?: metadata.deviceId ?: "carplay")
                     val homeKit=HomeKit(c,identity,ExperimentalHapV11::srp)
-                    shared=ExperimentalHapV11.authenticate(identifier,metadata.publicKey,
-                        store.experimental.load(identity,bootstrap.receiver,pairingId),
-                        setup={code->homeKit.setup(metadata.publicKey,code)},verify=homeKit::verify,
-                        saveVerified={peer->events.requireCurrent();store.experimental.saveVerified(identity,bootstrap.receiver,pairingId,peer)})
+                    val runAuthenticate:(PeerIdentity?)->ByteArray={previous->
+                        ExperimentalHapV11.authenticate(identifier,metadata.publicKey,previous,
+                            setup={code->homeKit.setup(metadata.publicKey,code)},verify=homeKit::verify,
+                            saveVerified={peer->events.requireCurrent();store.experimental.saveVerified(identity,bootstrap.receiver,pairingId,peer)})
+                    }
+                    val stored=store.experimental.load(identity,bootstrap.receiver,pairingId)
+                    shared=try{
+                        runAuthenticate(stored)
+                    }catch(t:SecurityFailure){
+                        // 用户删配对重新配对时，车机那边已经清空，本地这条 HAP 记录却还在，
+                        // authenticate 于是走 verify 而不是 setup，永远卡在验证失败。丢掉本地
+                        // 记录强制重做 pair-setup；没有本地记录时说明失败原因在别处，原样抛出。
+                        if(stored==null)throw t
+                        log("HAP verify failed while a local record existed; car evidently dropped the pairing — discarding it and redoing pair-setup (reason="+t.diagnostic+")")
+                        store.experimental.forget(identity,bootstrap.receiver,pairingId)
+                        runAuthenticate(null)
+                    }
                     log("Experimental HAP v11 verified; encrypted control/media active; AA/SAP root trust not established")
                 }else{
                     val recordKey=store.recordKey(identity,identifier)
