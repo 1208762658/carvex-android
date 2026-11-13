@@ -45,7 +45,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
               private val firstByteTimeoutMs:Int=1200,
               /** 首字节时限之后等首个 SYN 的时限；到期还没有 SYN 就判 NO_SYN 并拆链（T_detect）。
                * 1500ms：对端既然已经沉默，再等 5s 只是继续捶它，反而把它的残留态坐实。 */
-              private val detectTimeoutMs:Int=1500):AutoCloseable {
+              private val detectTimeoutMs:Int=3800):AutoCloseable {
     /** EAK body is a list of received PSNs; missing PSNs are derived locally. */
     enum class EakSchema { UNSUPPORTED, EAK_RECEIVED_LIST_V1 }
     enum class SynchronizationSchema { LINK_SYNC_V1_RELIABLE, LINK_SYNC_V1_IMMEDIATE_ACK }
@@ -258,6 +258,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
     private var preSynDeadlineToken=0L
     @Volatile private var firstByteSeen=false
     private val idleDetectSent=AtomicBoolean(false)
+    private val detectAttempts=java.util.concurrent.atomic.AtomicInteger(0)
     private val frames=IapFrameReader(this.input,log,{t->failLink(t)},
         detection={
             clearSynchronization()
@@ -408,13 +409,17 @@ class IapLink(input:InputStream, private val output:OutputStream,
      *  上层看不到任何事件。两个时限都只在握手前生效：`peerSyn` 一旦出现（含重复 SYN 的重发路径），
      *  重传与重复 SYN 预算由 [exchangeSynchronization] 接管，这里不再干预。 */
     private fun armHandshakeDeadlines(detectOnIdle:Boolean){
-        if(detectOnIdle&&firstByteTimeoutMs>0)handshakeDeadline.schedule({
-            if(closed.get()||firstByteSeen||handshakeComplete())return@schedule
-            if(!idleDetectSent.compareAndSet(false,true))return@schedule
-            log("iAP peer silent at DETECT: no detect RX in "+firstByteTimeoutMs+"ms (car-side iAP service not ready); sending Detect")
+        // 车机 ACL 刚接上时 iAP 服务常常还没就绪：20038 实测同一台车，第一个会话 1200ms 静默
+        // （NO_SYN 直接拆链），断开重连的第二个会话 138ms 就回 Detect。只发一次 Detect 等于把
+        // "服务晚起"这一类场景直接判死，所以改成周期重发，直到首个字节到达或预 SYN 预算用尽。
+        if(detectOnIdle&&firstByteTimeoutMs>0)handshakeDeadline.scheduleWithFixedDelay({
+            if(closed.get()||firstByteSeen||handshakeComplete())return@scheduleWithFixedDelay
+            idleDetectSent.set(true)
+            val n=detectAttempts.incrementAndGet()
+            log("iAP peer silent at DETECT: no detect RX in "+firstByteTimeoutMs+"ms (car-side iAP service not ready); sending Detect attempt="+n)
             runCatching{synchronized(writeLock){output.write(IapWire.detection);output.flush()}}
                 .onFailure{log("iAP Detect write failed: "+it.javaClass.simpleName+" "+(it.message?:""))}
-        },firstByteTimeoutMs.toLong(),TimeUnit.MILLISECONDS)
+        },firstByteTimeoutMs.toLong(),1200L,TimeUnit.MILLISECONDS)
         armPreSynDeadline()
     }
     /** Application safety budget, NOT a recovered Apple timeout policy.
