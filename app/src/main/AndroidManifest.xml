@@ -17,6 +17,8 @@
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- BLE 广播：验证"手机广播、车机扫描发现"这条拓扑是否才是 866F 的真实路径。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission
         android:name="android.permission.ACCESS_COARSE_LOCATION"
         android:maxSdkVersion="32" />

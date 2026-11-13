@@ -189,6 +189,42 @@ object Bootstrap {
     }
 
     /**
+     * BLE 广播探测。
+     *
+     * 反向拓扑：若车机不是广播方而是扫描方，那么手机就得把自己当成 CarPlay peripheral
+     * 广播出去，车机扫到之后才会来连。这里用经典 WiAP 的两个 UUID（cafe / 0a77）做广告，
+     * 目的只是判定"广播能不能起来、车机有没有反应"，不改动任何连接顺序。
+     */
+    private suspend fun bleAdvertise(context:Context,log:(String)->Unit){
+        val adapter=context.getSystemService(BluetoothManager::class.java)?.adapter?:return
+        if(!adapter.isEnabled){log("BLE advertise skipped: adapter off");return}
+        val adv=runCatching{adapter.bluetoothLeAdvertiser}.getOrNull()
+        if(adv==null){log("BLE advertise unavailable (advertiser null, missing BLUETOOTH_ADVERTISE?)");return}
+        val data=android.bluetooth.le.AdvertiseData.Builder()
+            .setIncludeDeviceName(false)
+            .addServiceUuid(android.os.ParcelUuid(java.util.UUID.fromString("00000000-deca-fade-deca-deafdecacafe")))
+            .addServiceUuid(android.os.ParcelUuid(java.util.UUID.fromString("02030302-1d19-415f-86f2-22a2106a0a77")))
+            .build()
+        val settings=android.bluetooth.le.AdvertiseSettings.Builder()
+            .setAdvertiseMode(android.bluetooth.le.AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(android.bluetooth.le.AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(true)
+            .build()
+        val cb=object:android.bluetooth.le.AdvertiseCallback(){
+            override fun onStartSuccess(s:android.bluetooth.le.AdvertiseSettings){log("BLE advertise started ok (cafe+0a77)")}
+            override fun onStartFailure(e:Int){log("BLE advertise failed code=$e")}
+        }
+        log("BLE advertise start")
+        val started=runCatching{adv.startAdvertising(settings,data,cb)}.onFailure{
+            log("BLE advertise exception: "+(it.message?:""))
+        }.isSuccess
+        if(!started)return
+        delay(6_000)
+        runCatching{adv.stopAdvertising(cb)}
+        log("BLE advertise stopped")
+    }
+
+    /**
      * 冷 ACL 预热。
      *
      * 车机的蓝牙可连接性由它自己的 UI 状态决定：配对中（PIN 确认）、配对刚完成
@@ -409,6 +445,7 @@ object Bootstrap {
                         // 说明车机侧根本没在响应 page；同步预热只会把本来就短的预算再
                         // 吃掉一两秒，v30 那次"拉不起 vex"就是这个后果。
                         val bleJob=launch{runCatching{bleProbe(context,device,log)}}
+                        val advJob=launch{runCatching{bleAdvertise(context,log)}}
                         val warmJob=launch{runCatching{warmAcl(context,device,log)}}
                         for(candidate in outboundCandidates){
                             if(!isActive||stopping.get()||winner.isCompleted)return@launch
