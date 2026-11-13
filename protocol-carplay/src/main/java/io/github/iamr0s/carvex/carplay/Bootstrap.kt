@@ -1249,7 +1249,19 @@ object Bootstrap {
         // 已经连在目标 SSID 上时直接复用现有网络：再发一次 specifier 会触发重新关联，
         // 打断正在使用的链路（现场表现为后续 TCP 连接 8 秒超时）。4301 给的凭据与此一致。
         runCatching{
-            val active=cm.activeNetwork
+            // 关键：车机热点没有互联网出口，Android 的默认路由会留在蜂窝上，
+            // 于是 cm.activeNetwork 根本不是那条 Wi-Fi——复用判据整段被跳过，
+            // 明明已经连着热点还是去 requestNetwork，再等 12 秒判死（20038 现场）。
+            // 这里改成在 allNetworks 里按 TRANSPORT_WIFI 找，而不是只看默认网络。
+            val wifiNetworks: List<android.net.Network> = runCatching{
+                cm.allNetworks.filter{n->cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)==true}
+            }.getOrElse{emptyList()}
+            if(wifiNetworks.size>1)log("Wi-Fi candidates on this device="+wifiNetworks.size+
+                " (defaultNetworkIsWifi="+(cm.activeNetwork?.let{cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)==true}))
+            val active=wifiNetworks.firstOrNull{n->cm.getLinkProperties(n)?.linkAddresses?.map{it.address}
+                    ?.filterIsInstance<java.net.Inet4Address>()?.isNotEmpty()==true}
+                ?:wifiNetworks.firstOrNull()
+                ?:cm.activeNetwork
             val caps=active?.let{cm.getNetworkCapabilities(it)}
             if(active!=null&&caps!=null&&caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)){
                 val current=(caps.transportInfo as? android.net.wifi.WifiInfo)?.ssid?.trim('"')
