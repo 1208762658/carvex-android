@@ -276,13 +276,18 @@ object BleTopologyProbe {
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[1])))
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[2])))
+            .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[3])))
+            .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[4])))
             .build()
 
         val supportsExtended = Build.VERSION.SDK_INT >= 26 &&
             runCatching { adapter.isLeExtendedAdvertisingSupported }.getOrDefault(false)
 
-        log("adv payload uuids=["+WANTED_UUIDS[0]+","+WANTED_UUIDS[1]+","+WANTED_UUIDS[2]+
-            "] carplayUuidIncluded=true (02030302-1d19-415f-86f2-22a2106a0a77)")
+        // iPhone 的 EIR 是五条 128-bit UUID（research/protocol/bluetooth_rfcomm/analysis/
+        // 01-discovery-and-eir.md 的 A1/A2/B1/B2/C1），20046 只放了三条，缺 B2 和 C1。
+        // 80 字节约 5 条 UUID，扩展广播上限 240 字节放得下。
+        log("adv payload uuids=["+WANTED_UUIDS.joinToString(",")+
+            "] count="+WANTED_UUIDS.size+" carplayUuidIncluded=true")
 
         var handle: Any? = null
         if (supportsExtended) {
