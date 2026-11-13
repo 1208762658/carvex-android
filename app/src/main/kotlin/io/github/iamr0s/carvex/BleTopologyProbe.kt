@@ -53,9 +53,9 @@ import java.util.concurrent.atomic.AtomicInteger
 object BleTopologyProbe {
     private const val TAG = "BELE"
     private const val SCAN_MS = 12_000L
-    private const val ADV_MS = 20_000L
+    private const val ADV_MS = 30_000L
     private const val IDLE_MS = 20_000L
-    private const val ROUNDS = 3
+    private const val ROUNDS = 1
 
     private val CARPLAY_HINTS = listOf(
         "carplay", "vw bt", "apple", "5384",
@@ -230,7 +230,7 @@ object BleTopologyProbe {
 
         // 两个 128-bit UUID = 32 字节，超过 legacy 31 字节上限，优先 extended。
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
+            .setIncludeDeviceName(true)
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[1])) )
             .build()
@@ -263,7 +263,7 @@ object BleTopologyProbe {
         } else {
             // 退到 legacy：只放一个 UUID，另一个塞 scan response，避免整包超长被截。
             val legacyData = AdvertiseData.Builder()
-                .setIncludeDeviceName(false)
+                .setIncludeDeviceName(true)
                 .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
                 .build()
             val scanResponse = AdvertiseData.Builder()
@@ -295,7 +295,7 @@ object BleTopologyProbe {
                 }
             }
             runCatching { server?.close() }
-            log("adv closed extended=$supportsExtended")
+            log("adv closed extended=$supportsExtended after ${ADV_MS}ms")
         }, ADV_MS)
     }
 }
