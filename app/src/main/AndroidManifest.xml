@@ -19,6 +19,9 @@
         android:usesPermissionFlags="neverForLocation" />
     <!-- BLE 广播：验证"手机广播、车机扫描发现"这条拓扑是否才是 866F 的真实路径。 -->
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- CarWith 启动时会把无前台保护的 CarVeX 当作后台进程回收，这里抬到前台档。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission
         android:name="android.permission.ACCESS_COARSE_LOCATION"
         android:maxSdkVersion="32" />
@@ -88,6 +91,11 @@
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    
+        <service
+            android:name="io.github.iamr0s.carvex.CarVexForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>
 

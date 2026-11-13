@@ -17,6 +17,8 @@ class BridgeApp:Application(),MixingServiceOwner{
     override fun onCreate(){
         super.onCreate()
         BridgeStore.init(this)
+        // CarWith 一打开就会回收无前台保护的 CarVeX；初始化完日志立刻抬到前台档。
+        CarVexForegroundService.ensure(this)
         // 连接历史要在任何界面读到它之前装好：首页第一段直接读它的 StateFlow。
         DeviceHistory.init(this)
         // 组装层启动 Koin：协议栈与宿主插件都从这里取；库模块自身不依赖 Koin。
