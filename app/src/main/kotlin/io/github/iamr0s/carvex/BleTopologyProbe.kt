@@ -171,7 +171,7 @@ object BleTopologyProbe {
         if (named.isNotEmpty()) log("scan names=" + named.take(24).joinToString(" | "))
     }
 
-    private fun advertiseOnce(context: Context, manager: BluetoothManager, adapter: android.bluetooth.BluetoothAdapter) {
+    private suspend fun advertiseOnce(context: Context, manager: BluetoothManager, adapter: android.bluetooth.BluetoothAdapter) {
         // GATT server：车机作为 central 连进来时的证据来源
         var serverRef: BluetoothGattServer? = null
         val serverCallback = object : BluetoothGattServerCallback() {
@@ -287,15 +287,19 @@ object BleTopologyProbe {
             handle = cb
         }
 
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            runCatching {
-                when (handle) {
-                    is AdvertisingSetCallback -> advertiser.stopAdvertisingSet(handle as AdvertisingSetCallback)
-                    is AdvertiseCallback -> advertiser.stopAdvertising(handle as AdvertiseCallback)
-                }
+        // 必须真正等待：之前用 Handler.postDelayed 后函数立刻返回，外层那行 "stopped"
+        // 只差 14 毫秒就打印出来，日志把"播满 30 秒"写成了"起播即停"。
+        val advertisingSince = System.currentTimeMillis()
+        kotlinx.coroutines.delay(ADV_MS/2)
+        log("adv heartbeat extended=$supportsExtended heldMs=${System.currentTimeMillis()-advertisingSince} (no gatt peer yet means the car is not scanning us)")
+        kotlinx.coroutines.delay(ADV_MS/2)
+        runCatching {
+            when (handle) {
+                is AdvertisingSetCallback -> advertiser.stopAdvertisingSet(handle as AdvertisingSetCallback)
+                is AdvertiseCallback -> advertiser.stopAdvertising(handle as AdvertiseCallback)
             }
-            runCatching { server?.close() }
-            log("adv closed extended=$supportsExtended after ${ADV_MS}ms")
-        }, ADV_MS)
+        }
+        runCatching { server?.close() }
+        log("adv closed extended=$supportsExtended heldMs=${System.currentTimeMillis()-advertisingSince}")
     }
 }
