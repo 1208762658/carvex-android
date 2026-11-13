@@ -97,6 +97,11 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <service
+            android:name="io.github.iamr0s.carvex.CarVexGuardService"
+            android:exported="false"
+            android:process=":guard"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>
 
