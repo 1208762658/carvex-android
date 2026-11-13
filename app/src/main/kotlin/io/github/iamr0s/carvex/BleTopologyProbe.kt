@@ -265,15 +265,24 @@ object BleTopologyProbe {
             return
         }
 
-        // 两个 128-bit UUID = 32 字节，超过 legacy 31 字节上限，优先 extended。
+        // 三个 128-bit UUID = 48 字节，只有 extended 放得下。
+        // 第三个是 02030302-...-0a77：Apple 的 CarPlay BLE 服务标识（research/
+        // protocol/bluetooth_rfcomm/analysis/01-discovery-and-eir.md 的 A2）。此前
+        // 它只出现在扫描白名单和 GATT characteristic 里，从未进过广播包，所以 866F
+        // 即使扫到这台手机也看不出它支持 CarPlay——这很可能就是"车机不自动切到
+        // CarPlay 页、要驾驶员手动点"的原因：真 iPhone 的 EIR 里有这条标识。
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
             .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
-            .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[1])) )
+            .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[1])))
+            .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[2])))
             .build()
 
         val supportsExtended = Build.VERSION.SDK_INT >= 26 &&
             runCatching { adapter.isLeExtendedAdvertisingSupported }.getOrDefault(false)
+
+        log("adv payload uuids=["+WANTED_UUIDS[0]+","+WANTED_UUIDS[1]+","+WANTED_UUIDS[2]+
+            "] carplayUuidIncluded=true (02030302-1d19-415f-86f2-22a2106a0a77)")
 
         var handle: Any? = null
         if (supportsExtended) {
@@ -298,13 +307,15 @@ object BleTopologyProbe {
                 .onFailure { log("adv set exception: " + (it.message ?: "")) }
             handle = cb
         } else {
-            // 退到 legacy：只放一个 UUID，另一个塞 scan response，避免整包超长被截。
+            // 退到 legacy：31 字节上限只够放一个 128-bit UUID，所以把最能决定"车机是否
+        // 认它作 CarPlay 设备"的那一个（02030302-...-0a77）放进主包，cafe 放 scan response。
+            // legacy 主包只有 31 字节：设备名 + 128-bit UUID 会超，名字必须让位。
             val legacyData = AdvertiseData.Builder()
-                .setIncludeDeviceName(true)
-                .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
+                .setIncludeDeviceName(false)
+                .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[2])))
                 .build()
             val scanResponse = AdvertiseData.Builder()
-                .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[1])))
+                .addServiceUuid(ParcelUuid(UUID.fromString(WANTED_UUIDS[0])))
                 .build()
             val settings = AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
