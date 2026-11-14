@@ -340,19 +340,30 @@ object BleTopologyProbe {
             handle = cb
         }
 
-        // 必须真正等待：之前用 Handler.postDelayed 后函数立刻返回，外层那行 "stopped"
-        // 只差 14 毫秒就打印出来，日志把"播满 30 秒"写成了"起播即停"。
+        // 常驻广播（v50）：2.2 日志证明车机在启动时会主动回连手机，而我们的广播只播 30 秒就收工
+        // （00:31:39 start → 00:32:20 起就再无 adv），车机那侧重启时大概率扫不到我们，只能等
+        // 用户手动点一次把 App 唤醒再播。真 iPhone 是一直在广播的，这里对齐同样的行为：
+        // 进程活着就一直播，GATT server 也一直开着，任何时刻车机来扫都能命中。
         val advertisingSince = System.currentTimeMillis()
-        kotlinx.coroutines.delay(ADV_MS/2)
-        log("adv heartbeat extended=$supportsExtended heldMs=${System.currentTimeMillis()-advertisingSince} (no gatt peer yet means the car is not scanning us)")
-        kotlinx.coroutines.delay(ADV_MS/2)
-        runCatching {
+        try {
+            var beats = 0
+            while (true) {
+                kotlinx.coroutines.delay(ADV_MS / 2)
+                beats++
+                // 每 10 个心跳（约 2.5 分钟）打一行，避免日志被心跳刷满。
+                if (beats % 10 == 1) {
+                    log("adv heartbeat persistent extended=$supportsExtended heldMs=${System.currentTimeMillis() - advertisingSince} (no gatt peer yet means the car is not scanning us)")
+                }
+            }
+        } finally {
+            runCatching {
             when (handle) {
                 is AdvertisingSetCallback -> advertiser.stopAdvertisingSet(handle as AdvertisingSetCallback)
                 is AdvertiseCallback -> advertiser.stopAdvertising(handle as AdvertiseCallback)
             }
         }
-        runCatching { server?.close() }
-        log("adv closed extended=$supportsExtended heldMs=${System.currentTimeMillis()-advertisingSince}")
+            runCatching { server?.close() }
+            log("adv closed extended=$supportsExtended heldMs=${System.currentTimeMillis()-advertisingSince}")
+        }
     }
 }
