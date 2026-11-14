@@ -89,14 +89,25 @@ class CarVexForegroundService : Service() {
         val marker = state.id + "#" + state.attempt
         if (wokeFor == marker) return
         wokeFor = marker
-        runCatching {
-            // 老 API 的亮屏锁在新系统上不保证生效，所以全屏意图才是主路径；这里只是兜底。
+        // 只亮屏、不起 Activity：屏幕亮起后停在锁屏，进度就是锁屏上那条通知。
+        // PowerManager.wakeUp() 是 @hide（DEVICE_POWER，签名级）：CarLife 的权限底子若真落到本包，
+        // 反射调用就能亮屏；拿不到权限就退回老 API 的亮屏锁。
+        val byWakeUp = runCatching {
+            PowerManager::class.java
+                .getMethod("wakeUp", Long::class.javaPrimitiveType, String::class.java)
+                .invoke(pm, android.os.SystemClock.uptimeMillis(), "carvex:progress")
+        }.isSuccess
+        val byLock = if (byWakeUp) false else runCatching {
             @Suppress("DEPRECATION")
             pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "carvex:wake")
                 .apply { setReferenceCounted(false) }
-                .acquire(10_000L)
-            BridgeStore.log(state.id, "screen woken for connection progress")
-        }.onFailure { BridgeStore.log(state.id, "screen wake failed: " + it.javaClass.simpleName + " " + (it.message ?: "")) }
+                .acquire(8_000L)
+            true
+        }.onFailure {
+            BridgeStore.log(state.id, "screen wake failed: " + it.javaClass.simpleName + " " + (it.message ?: ""))
+        }.getOrDefault(false)
+        BridgeStore.log(state.id, "screen woken for progress (wakeUp=" + byWakeUp + " fallbackLock=" + byLock +
+            " deviceIdle=" + pm.isDeviceIdleMode + " powerSave=" + pm.isPowerSaveMode + ")")
     }
 
     private fun build(state: io.github.iamr0s.carvex.sessioncore.SessionState): Notification {
@@ -111,9 +122,6 @@ class CarVexForegroundService : Service() {
             .setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PUBLIC) // 锁屏上也显示明文进度
             .setContentIntent(openApp())
-            .apply {
-                if (state.stage != Stage.IDLE) setFullScreenIntent(openApp(), true)
-            }
             .build()
         return n
     }
@@ -149,12 +157,13 @@ class CarVexForegroundService : Service() {
             createChannel()
             post(build(BridgeStore.state.value))
             BridgeStore.log("", "Foreground service promoted (connectedDevice) so CarWith cannot reclaim us")
-            if (Build.VERSION.SDK_INT >= 34) {
-                val nm = getSystemService(NotificationManager::class.java)
-                if (nm?.canUseFullScreenIntent() == false) {
-                    BridgeStore.log("", "full-screen intent not granted; lockscreen wake falls back to the notification banner")
-                }
-            }
+            val nm = getSystemService(NotificationManager::class.java)
+            val pm = getSystemService(PowerManager::class.java)
+            BridgeStore.log("", "keepalive env: notificationsEnabled=" + (nm?.areNotificationsEnabled() == true) +
+                " channelImportance=" + nm?.getNotificationChannel(CHANNEL_ID)?.importance +
+                " interactive=" + pm?.isInteractive + " deviceIdle=" + pm?.isDeviceIdleMode +
+                " powerSave=" + pm?.isPowerSaveMode +
+                " batteryOptIgnored=" + (pm?.isIgnoringBatteryOptimizations(packageName) == true))
         }.onFailure {
             BridgeStore.log("", "Foreground service promote failed: " + (it.message ?: it.javaClass.simpleName))
         }

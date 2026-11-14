@@ -17,6 +17,16 @@ class BridgeApp:Application(),MixingServiceOwner{
     override fun onCreate(){
         super.onCreate()
         BridgeStore.init(this)
+        // 息屏场景的判定基线：进程是被 cw 拉起的还是系统重建的，此刻屏幕/Doze 处于什么状态，
+        // 都在这行里。没有这行，息屏连不上时无法区分"没起来"和"起来了但被掐"。
+        runCatching {
+            val pm = getSystemService(android.os.PowerManager::class.java)
+            val km = getSystemService(android.app.KeyguardManager::class.java)
+            BridgeStore.log("", "process start env interactive=" + pm?.isInteractive +
+                " deviceIdle=" + pm?.isDeviceIdleMode + " powerSave=" + pm?.isPowerSaveMode +
+                " batteryOptIgnored=" + (pm?.isIgnoringBatteryOptimizations(packageName) == true) +
+                " keyguardLocked=" + km?.isKeyguardLocked + " sdk=" + Build.VERSION.SDK_INT)
+        }
         // CarWith 一打开就会回收无前台保护的 CarVeX；初始化完日志立刻抬到前台档。
         CarVexForegroundService.ensure(this)
         // 连接历史要在任何界面读到它之前装好：首页第一段直接读它的 StateFlow。

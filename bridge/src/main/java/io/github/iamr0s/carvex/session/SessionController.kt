@@ -187,6 +187,10 @@ class SessionController(
         // 息屏后 CPU 进 suspend、WiFi 进省电档，iAP2/RTSP 线程会停摆。前台服务只抬优先级，
         // 挡不住这件事，所以整个 attempt 期间持锁，退出时在 finally 释放。
         SessionWakeLock.acquire(context,id)
+        runCatching {
+            val pm=context.getSystemService(android.os.PowerManager::class.java)
+            BridgeStore.log(id,"attempt start env: interactive="+pm?.isInteractive+" deviceIdle="+pm?.isDeviceIdleMode+" powerSave="+pm?.isPowerSaveMode)
+        }
         val failed=CompletableDeferred<Throwable>()
         val attemptJob=currentCoroutineContext().job
         val sessionScope=CoroutineScope(currentCoroutineContext())

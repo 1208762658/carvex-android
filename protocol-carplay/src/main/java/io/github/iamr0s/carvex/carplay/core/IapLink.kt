@@ -44,8 +44,10 @@ class IapLink(input:InputStream, private val output:OutputStream,
                * 白白占用时间并把重试拖成 7 秒一轮。 */
               private val firstByteTimeoutMs:Int=1200,
               /** 首字节时限之后等首个 SYN 的时限；到期还没有 SYN 就判 NO_SYN 并拆链（T_detect）。
-               * 1500ms：对端既然已经沉默，再等 5s 只是继续捶它，反而把它的残留态坐实。 */
-              private val detectTimeoutMs:Int=3800):AutoCloseable {
+               * 15000ms：2.2 日志（20056）证明车机冷启动后 iAP 服务要几十秒才起来 —— 04:35:23
+               * 屏幕灭着，Detect 连发 4 次全静默，5000ms 预算到点判死；04:35:58 车机就绪后同一台
+               * 车 67ms 就回 Detect。预算必须盖住"车机起床"这段，否则每次上车首次连接必失败。 */
+              private val detectTimeoutMs:Int=15000):AutoCloseable {
     /** EAK body is a list of received PSNs; missing PSNs are derived locally. */
     enum class EakSchema { UNSUPPORTED, EAK_RECEIVED_LIST_V1 }
     enum class SynchronizationSchema { LINK_SYNC_V1_RELIABLE, LINK_SYNC_V1_IMMEDIATE_ACK }
