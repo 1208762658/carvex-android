@@ -1186,6 +1186,91 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** Cache real metadata until this Link subscribes. False means no selected update was sent. */
     fun nowPlaying(track:NowPlayingUpdate.Track,replaceMedia:Boolean=false):Boolean =
         nowPlayingPublisher.update(track,replaceMedia)
+    private val artworkTransferId=java.util.concurrent.atomic.AtomicInteger(0)
+    /** 封面是数据面工作：单独一条线程排队，绝不占事件线程，也不与控制会话的发送顺序混在一起。 */
+    private val artworkSender=java.util.concurrent.Executors.newSingleThreadExecutor{task->
+        Thread(task,"carvex-artwork").apply{isDaemon=true}
+    }
+    private fun nextArtworkTransferId():Byte {
+        // 0 留给"没有传输"，其余循环使用；同一时刻只跑一条传输。
+        val next=artworkTransferId.updateAndGet{value->if(value>=255)1 else value+1}
+        return next.toByte()
+    }
+    /** 发出的数据面帧要等链路 ACK 才算"进去了"：异步提交 + 有界等待。 */
+    private fun sendArtworkPacket(sessionId:Int,packet:ByteArray,timeoutMs:Long=8000):Throwable? {
+        val done=java.util.concurrent.CountDownLatch(1)
+        val failure=java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        if(!runtime.sendSessionRaw(sessionId,packet){t->failure.set(t);done.countDown()})
+            return IOException("iAP session data submit rejected")
+        val finished=try{done.await(timeoutMs,java.util.concurrent.TimeUnit.MILLISECONDS)}
+            catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+        if(!finished)return java.net.SocketTimeoutException("iAP session data not acknowledged in "+timeoutMs+"ms")
+        return failure.get()
+    }
+    /**
+     * 封面投递：建立文件传输 → 在 5001 里报出封面传输 ID → 分块送 JPEG → 结束。
+     *
+     * 两道门控，保证不会乱来：
+     *  1. 车机 SYN 里没有 kind=1（文件传输）会话 → 整段 no-op，一帧都不发；
+     *  2. `carvex.artwork.transfer=0` → 退回"只出 id 不出图"的原行为。
+     * 失败只作废这一张封面，控制会话（正在播放的媒体/视频/音频）不受影响。
+     */
+    fun artwork(jpeg:ByteArray):Boolean {
+        if(System.getProperty("carvex.artwork.transfer")?.trim()=="0"){
+            log("artwork transfer disabled by carvex.artwork.transfer=0; id only")
+            return false
+        }
+        val sessionId=runtime.fileTransferSession()
+        if(sessionId==null){
+            log("artwork id ready but the peer proposed no kind1 (file-transfer) session; nothing sent")
+            return false
+        }
+        val mtu=runtime.maxSessionPacketBytes()
+        val perPacket=mtu-2
+        if(perPacket<8){log("artwork transfer skipped: iAP session MTU too small mtu=$mtu");return false}
+        val transferId=nextArtworkTransferId()
+        val chunkCount=(jpeg.size+perPacket-1)/perPacket
+        log("artwork transfer submitted session=$sessionId transferId=$transferId chunks=$chunkCount"+
+            " bytes="+jpeg.size+" mtu=$mtu")
+        artworkSender.execute{
+            runtime.resetSessionDataFailure()
+            var failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.start(transferId,jpeg.size.toLong()))
+            if(failure!=null){
+                log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                return@execute
+            }
+            // 建立成功之后再把 ID 写进 5001：车机此刻已经在等这条传输的内容。
+            val announced=runCatching{
+                runtime.send(NowPlayingUpdate.ID,listOf(
+                    0 to IapWire.fields(listOf(0x1a to byteArrayOf(transferId))))
+                )
+            }.getOrElse{false}
+            log("artwork announce 5001 group0/0x1a id=$transferId sent=$announced")
+            var offset=0
+            var sent=0
+            while(offset<jpeg.size){
+                val end=minOf(jpeg.size,offset+perPacket)
+                val packet=ArtworkFileTransfer.chunk(transferId,jpeg.copyOfRange(offset,end))
+                failure=sendArtworkPacket(sessionId,packet)
+                if(failure!=null){
+                    log("artwork transfer abandoned at chunk="+sent+" offset="+offset+"/"+jpeg.size+
+                        ": "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                    return@execute
+                }
+                offset=end;sent++
+                if(sent==1||sent==chunkCount||sent%8==0)
+                    log("artwork chunk progress "+sent+"/"+chunkCount+" bytes="+offset)
+            }
+            failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
+            if(failure!=null){
+                log("artwork transfer abandoned at complete: "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                return@execute
+            }
+            log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
+                " bytes="+jpeg.size)
+        }
+        return true
+    }
     /** Firmware message 5201. The caller must have an active 5200 subscription. */
     fun navigationRouteUpdate(values:List<Pair<Int,ByteArray>>):Boolean =
         if(!NavigationGuidance.active) false

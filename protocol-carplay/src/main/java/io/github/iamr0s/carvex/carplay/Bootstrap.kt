@@ -421,41 +421,56 @@ object Bootstrap {
                         // 35–162ms 失败或 page 超时。因此失败后不立刻放弃，而是在窗口期内低频
                         // 反复拨号：用户点车机的那一刻，下一轮探测就能抓住。
                         if(!stopping.get()&&!winner.isCompleted){
+                            // v51：866F 只在司机点过 CarPlay 之后才开放蓝牙连接窗口，而 cw 给我们的
+                            // 这一次 attempt 只能活几十秒。串行 1..6 每通道 5s，一轮就要 35s，窗口
+                            // 在这期间打开也只能等到下一轮——等于白等。改成六个通道并发拨号：
+                            // 谁先通谁赢，一轮约 5s，20s 内至少 4 轮，捕获延迟压到 5s 以内。
                             val windowUntil=android.os.SystemClock.elapsedRealtime()+20_000L
                             var round=0
+                            var lastRaw:Exception?=null
                             while(!stopping.get()&&!winner.isCompleted&&
                                 android.os.SystemClock.elapsedRealtime()<windowUntil){
                                 round++
-                                log("RFCOMM window probe round=$round (car opens the window only after the driver taps CarPlay)")
-                            for(channel in 1..6){
-                                if(stopping.get()||winner.isCompleted)break
-                                val raw=rawRfcommSocket(device,channel)
-                                if(raw==null){
-                                    log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
-                                    continue
+                                log("RFCOMM window probe round=$round parallel channels=1..6"+
+                                    " (car opens the window only after the driver taps CarPlay)")
+                                coroutineScope{
+                                    (1..6).map{channel->async(Dispatchers.IO){
+                                        if(stopping.get()||winner.isCompleted)return@async
+                                        val raw=rawRfcommSocket(device,channel)
+                                        if(raw==null){
+                                            log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
+                                            return@async
+                                        }
+                                        r.own(raw);activeOutbound.set(raw)
+                                        val startedAt=android.os.SystemClock.elapsedRealtime()
+                                        log("RFCOMM raw channel=$channel attempt (SDP bypass)")
+                                        trace("tx","channel$channel","attempt","RAW_CHANNEL")
+                                        // connect() 自己不会超时；并发拨号时必须有看门狗把它的
+                                        // 5s 上限兜住，否则一轮又会被最慢的通道拖回 35s。
+                                        val killer=launch{delay(6_000);runCatching{raw.close()}}
+                                        try{
+                                            raw.connect()
+                                            killer.cancel()
+                                            activeOutbound.compareAndSet(raw,null)
+                                            if(stopping.get()||winnerSocket.get()!=null){
+                                                r.release(raw);return@async
+                                            }
+                                            log("RFCOMM raw channel=$channel connected without SDP")
+                                            select(raw,"channel$channel")
+                                        }catch(t:Exception){
+                                            killer.cancel()
+                                            activeOutbound.compareAndSet(raw,null)
+                                            if(t is CancellationException)throw t
+                                            if(winnerSocket.get()!==raw)r.release(raw)
+                                            val el=android.os.SystemClock.elapsedRealtime()-startedAt
+                                            log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
+                                            lastRaw=t
+                                        }
+                                    }}.awaitAll()
                                 }
-                                r.own(raw);activeOutbound.set(raw)
-                                val startedAt=android.os.SystemClock.elapsedRealtime()
-                                log("RFCOMM raw channel=$channel attempt (SDP bypass)")
-                                trace("tx","channel$channel","attempt","RAW_CHANNEL")
-                                try{
-                                    raw.connect()
-                                    if(stopping.get()){r.release(raw);break}
-                                    log("RFCOMM raw channel=$channel connected without SDP")
-                                    select(raw,"channel$channel");return@launch
-                                }catch(t:Exception){
-                                    activeOutbound.compareAndSet(raw,null)
-                                    if(winnerSocket.get()!==raw)r.release(raw)
-                                    if(t is CancellationException)throw t
-                                    val el=android.os.SystemClock.elapsedRealtime()-startedAt
-                                    log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
-                                    last=t
-                                }
-                                delay(600)
-                                if(winner.isCompleted)break
-                            }
+                                last=lastRaw?:last
                                 if(stopping.get()||winner.isCompleted)break
-                                delay(1_000)
+                                delay(400)
                             }
                         }
                         activeOutbound.set(null)

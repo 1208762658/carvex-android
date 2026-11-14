@@ -29,6 +29,11 @@ sealed interface IapCommand {
     }
 }
 
+/** 业务会话数据面失败：只作废这一次传输（例如一张封面），不影响控制会话。
+ *  与控制会话 ACK 超时（整条链路判死）刻意区分开。 */
+class IapSessionDataFailure(val sessionId:Int,cause:Throwable):
+    java.io.IOException("iAP session data abandoned: session="+sessionId+" "+(cause.message?:""),cause)
+
 /** One outstanding frame; reader alone owns inbound sequence and CSM reassembly. */
 class IapLink(input:InputStream, private val output:OutputStream,
               private val log:(String)->Unit, private val failure:(Throwable)->Unit,
@@ -100,6 +105,16 @@ class IapLink(input:InputStream, private val output:OutputStream,
     /** Null until the peer has acknowledged this synchronization's initial sequence. */
     @Volatile var negotiatedControlSession:ControlSession?=null
         private set
+    /** 车机 SYN 里的完整会话表。之前只留下控制会话，业务会话号（kind1 文件传输等）被直接丢掉，
+     *  于是封面这种必须走"会话类型 1"的数据面根本没有可投递的通道。这里按原提案整表保留：
+     *  控制 CSM 仍只走 [negotiatedControlSession]，业务数据按 [sessionOfKind] 取号的会话投递。 */
+    @Volatile var negotiatedSessions:List<ControlSession> = emptyList()
+        private set
+    fun sessionOfKind(kind:Int):ControlSession? = negotiatedSessions.firstOrNull{it.kind==kind}
+    /** 业务会话（kind!=0）上一次数据面失败。失败只作废本次传输，不动控制链路。 */
+    @Volatile var lastSessionDataFailure:Throwable?=null
+        private set
+    fun resetSessionDataFailure(){lastSessionDataFailure=null}
     /** Successful link synchronizations, including the initial one; never reused after a restart. */
     @Volatile var generation:Int=0
         private set
@@ -274,6 +289,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
       synchronized(writeLock){
         cancelPendingSynAck()
         negotiatedControlSession=null
+        negotiatedSessions=emptyList()
         negotiatedSynchronizationSchema=null;peerSyn=null;localSynAck=null
         synchronized(ackLock){
             ackTask?.cancel(false);ackTask=null;ackPending=false
@@ -666,6 +682,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
                         SynchronizationSchema.LINK_SYNC_V1_IMMEDIATE_ACK else SynchronizationSchema.LINK_SYNC_V1_RELIABLE
                     generation++
                     // Publish the ready marker LAST, after all active fields.
+                    // 先落会话表，再发 ready 标记：ready 之后读表的人一定能看到业务会话。
+                    negotiatedSessions=local.sessions
                     negotiatedControlSession=session
                     log("iAP synchronized session="+control+" version="+controlVersion+" maxPacket="+maxPacket+
                         " proposals="+budget.proposals+" epoch="+handshakeEpoch)
@@ -924,11 +942,38 @@ class IapLink(input:InputStream, private val output:OutputStream,
             true
         } catch(_:RejectedExecutionException) { false }
     }
-    @Synchronized private fun sendCsm(data:ByteArray,expectedGeneration:Int?=null) {
+    /** 业务会话（kind!=0）的数据面投递：不套 CSM，载荷就是该会话自己的 datagram。
+     *  ACK/重传/窗口与控制会话共用同一套链路状态，区别只在失败语义：控制会话的 ACK 超时
+     *  仍然整条判死；业务会话超时只作废本次传输，否则一张封面传不完就会把正在播放的
+     *  控制会话一起带走（这正是另一台环境 `fix/artwork-20041` 里 892dec8 修的那件事）。 */
+    fun sendSessionRawAsync(sessionId:Int,payload:ByteArray,expectedGeneration:Int?=null,
+                            completion:(Throwable?)->Unit={}):Boolean {
+        if(closed.get()||error!=null)return false
+        val copy=payload.copyOf()
+        return try {
+            asyncSender.execute {
+                var failureCause:Throwable?=null
+                try { transmit(copy,sessionId,expectedGeneration,poisonLinkOnTimeout=false) }
+                catch(t:Throwable){ failureCause=t }
+                finally { runCatching{completion(failureCause)} }
+            }
+            true
+        } catch(_:RejectedExecutionException){ false }
+    }
+    /** 单帧能装多少业务会话载荷；上层按它把一张封面的字节流切块。 */
+    fun maxSessionPacketBytes():Int=maxPayloadBytes()
+
+    @Synchronized private fun sendCsm(data:ByteArray,expectedGeneration:Int?=null) =
+        transmit(data,null,expectedGeneration,poisonLinkOnTimeout=true)
+
+    @Synchronized private fun transmit(data:ByteArray,sessionId:Int?,expectedGeneration:Int?,
+                                       poisonLinkOnTimeout:Boolean) {
         val snapshot=synchronized(writeLock){
             check(expectedGeneration==null||expectedGeneration==generation){"iAP control generation changed before send"}
-            val session=checkNotNull(negotiatedControlSession){"iAP link has no confirmed control session"}
-            Triple(session,synchronizationEpoch,generation)
+            val target=if(sessionId==null)checkNotNull(negotiatedControlSession){"iAP link has no confirmed control session"}
+                else negotiatedSessions.firstOrNull{it.id==sessionId}
+                    ?:throw IOException("iAP session "+sessionId+" not in the negotiated proposal")
+            Triple(target,synchronizationEpoch,generation)
         }
         val (session,epoch,controlGeneration)=snapshot
         val chunks=buildList{
@@ -941,7 +986,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
         var nextChunk=0
         while(nextChunk<chunks.size||synchronized(ackLock){txSlots.isNotEmpty()}){
             check(!closed.get()); error?.let{throw IOException("iAP reader failed",it)}
-            check(synchronizationEpoch==epoch&&negotiatedControlSession==session){"iAP link synchronization changed during send"}
+            check(synchronizationEpoch==epoch&&negotiatedSessions.any{it.id==session.id}){"iAP link synchronization changed during send"}
             val pendingWrites=mutableListOf<IapWire.Frame>()
             val now=System.nanoTime()
             synchronized(ackLock){
@@ -963,8 +1008,16 @@ class IapLink(input:InputStream, private val output:OutputStream,
                             (now-slot.sentAtNanos)>=retryMs*1_000_000L
                         if(!due)continue
                         if(slot.attempts>=retryLimit){
-                            val timeout=java.net.SocketTimeoutException("iAP ACK timeout seq="+slot.seq)
-                            error=timeout;negotiatedControlSession=null;close();failure(timeout);throw timeout
+                            val timeout=java.net.SocketTimeoutException(
+                                "iAP ACK timeout seq="+slot.seq+" session="+session.id)
+                            if(session.kind==0&&poisonLinkOnTimeout){
+                                error=timeout;negotiatedControlSession=null;close();failure(timeout);throw timeout
+                            }
+                            // 业务会话失败：丢掉本会话未 ACK 的槽位、短路本次传输。控制会话、
+                            // 序号基线与视频/音频都不受影响；下一次封面或重同步时重新起步。
+                            txSlots.clear();pendingSeq=-1;receivedAck=-1
+                            lastSessionDataFailure=timeout
+                            throw IapSessionDataFailure(session.id,timeout)
                         }
                         slot.attempts++
                         slot.sentAtNanos=now
@@ -977,7 +1030,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
             pendingWrites.forEach{frame->
                 check(synchronizationEpoch==epoch&&!closed.get()){ "iAP link synchronization changed during send" }
                 synchronized(writeLock){
-                    check(synchronizationEpoch==epoch&&generation==controlGeneration&&negotiatedControlSession==session)
+                    check(synchronizationEpoch==epoch&&generation==controlGeneration&&
+                        negotiatedSessions.any{it.id==session.id})
                     write(frame)
                 }
             }
@@ -993,7 +1047,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
             }
         }
         synchronized(ackLock){pendingSeq=-1}
-        log("iAP TX "+IapWire.u16(data,4).toString(16))
+        log(if(session.kind==0)"iAP TX "+IapWire.u16(data,4).toString(16)
+            else "iAP TX session="+session.id+" kind="+session.kind+" bytes="+data.size+" (data plane)")
     }
     fun await(id:Int,seconds:Long=20):IapFields = synchronized(consumerLock) {
         val cached=synchronized(deferredLock){deferred.firstOrNull{it.id==id&&it.fields!=null}?.also{deferred.remove(it)}}

@@ -132,6 +132,25 @@ class RuntimeIap(private val emit:(ByteArray)->Boolean,private val log:(String)-
             }
         }catch(t:Throwable){fail(t);false}
     }
+    /** 车机 SYN 里 kind=1（文件传输）会话的会话号；没有就是 null，调用方据此整段 no-op。 */
+    fun fileTransferSession():Int? = link.sessionOfKind(1)?.id
+    /** 单帧能装多少业务会话载荷。 */
+    fun maxSessionPacketBytes():Int = link.maxSessionPacketBytes()
+    /** 在指定业务会话上提交一帧数据面报文（不套 CSM）。 */
+    fun sendSessionRaw(sessionId:Int,payload:ByteArray,completion:(Throwable?)->Unit={}):Boolean {
+        if(closed.get()||degraded.get())return false
+        return try{
+            if(negotiate!=null)check(link.generation==authorizedGeneration&&link.linkEpoch==authorizedEpoch&&
+                link.negotiatedControlSession!=null)
+            link.sendSessionRawAsync(sessionId,payload,
+                if(negotiate!=null)authorizedGeneration else null,completion)
+        }catch(t:Throwable){
+            completion(t);false
+        }
+    }
+    fun lastSessionDataFailure():Throwable? = link.lastSessionDataFailure
+    fun resetSessionDataFailure(){link.resetSessionDataFailure()}
+
     fun fail(t:Throwable){
         if(closed.get()||!degraded.compareAndSet(false,true))return
         log("Runtime iAP degraded: "+t.javaClass.simpleName+" "+(t.message?:"")+"; retain Bluetooth/video")

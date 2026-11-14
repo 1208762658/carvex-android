@@ -354,8 +354,28 @@ class SessionController(
                             BridgeStore.log(id,"CarLife music Intent send failed: "+it.javaClass.simpleName)
                         }}
                     }else BridgeStore.log(id,"CarLife music Intent had no recognized metadata fields")
-                    if(CarLifeMusicIntent.hasArtwork(intent))
-                        BridgeStore.log(id,"CarLife music artwork observed; 5001 artwork file transfer remains unimplemented")
+                    if(CarLifeMusicIntent.hasArtwork(intent)){
+                        // v51：封面从"只记日志"改成真发。取图/缩放放 IO，投递走 AirSession 的
+                        // 文件传输线程；任一环节失败都只放弃这一张，不碰控制会话。
+                        scope.launch(Dispatchers.IO){
+                            val jpeg=runCatching{CarLifeArtwork.normalize(context,intent){line->BridgeStore.log(id,line)}}
+                                .onFailure{BridgeStore.log(id,"CarLife artwork decode failed: "+it.javaClass.simpleName+" "+(it.message?:""))}
+                                .getOrNull()
+                            if(jpeg==null){
+                                BridgeStore.log(id,"CarLife music artwork observed but no usable JPEG; nothing sent")
+                                return@launch
+                            }
+                            val air=musicAir.get()?:activeAir
+                            if(air==null){
+                                BridgeStore.log(id,"CarLife artwork ready but no AirSession yet; nothing sent")
+                                return@launch
+                            }
+                            val submitted=runCatching{air.artwork(jpeg)}
+                                .onFailure{BridgeStore.log(id,"CarLife artwork submit failed: "+it.javaClass.simpleName+" "+(it.message?:""))}
+                                .getOrDefault(false)
+                            BridgeStore.log(id,"CarLife artwork bytes="+jpeg.size+" submitted="+submitted)
+                        }
+                    }
                     return
                 }
                 when(action){
