@@ -21,6 +21,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <!-- CarWith 启动时会把无前台保护的 CarVeX 当作后台进程回收，这里抬到前台档。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 会话期间持有 PARTIAL_WAKE_LOCK + WIFI_LOCK：前台服务只抬进程优先级，不阻止
+         息屏后 CPU 进 suspend/Doze，socket 线程会跟着停。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission
         android:name="android.permission.ACCESS_COARSE_LOCATION"

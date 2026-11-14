@@ -184,6 +184,9 @@ class SessionController(
             BridgeStore.log(id,"Resource close type="+trace.type+" elapsedMs="+trace.elapsedMs+" error="+trace.error)
         }
         val cleanup=SessionTermination{r.close()};termination=cleanup
+        // 息屏后 CPU 进 suspend、WiFi 进省电档，iAP2/RTSP 线程会停摆。前台服务只抬优先级，
+        // 挡不住这件事，所以整个 attempt 期间持锁，退出时在 finally 释放。
+        SessionWakeLock.acquire(context,id)
         val failed=CompletableDeferred<Throwable>()
         val attemptJob=currentCoroutineContext().job
         val sessionScope=CoroutineScope(currentCoroutineContext())
@@ -1068,7 +1071,9 @@ class SessionController(
             val firstFrameDeadline=video?.let{timer.schedule({if(frames.get()==0L)failure(java.net.SocketTimeoutException("No video frame written"))},15000,TimeUnit.MILLISECONDS)}
             try{throw failed.await()}finally{firstFrameDeadline?.cancel(false)}
         } finally {
-            ended.set(true);voiceToggle.close();startAudio.set(null);startSpeech.set(null);audioDemand.close();metrics.cancel(false);applyDynamicFps=null;applyBitrate=null;sendKey=null;carPlayAudioTestJob?.cancel();carPlayAudioTestJob=null;carWithAudioProbeJob?.cancel();carWithAudioProbeJob=null
+            ended.set(true)
+            SessionWakeLock.release(id,"attempt ended")
+            voiceToggle.close();startAudio.set(null);startSpeech.set(null);audioDemand.close();metrics.cancel(false);applyDynamicFps=null;applyBitrate=null;sendKey=null;carPlayAudioTestJob?.cancel();carPlayAudioTestJob=null;carWithAudioProbeJob?.cancel();carWithAudioProbeJob=null
             cleanup.close()
             withContext(NonCancellable){cleanup.awaitClosed()}
             if(termination===cleanup)termination=null
