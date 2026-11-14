@@ -27,6 +27,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 从锁屏通知/全屏意图进来：允许盖在锁屏上并点亮屏幕，好让息屏状态下也能看到进度。
+        if (intent?.getBooleanExtra(io.github.iamr0s.carvex.CarVexForegroundService.EXTRA_WAKE, false) == true) {
+            runCatching {
+                setShowWhenLocked(true)
+                setTurnScreenOn(true)
+            }
+        }
         setContent {
             val state by vm.state.collectAsStateWithLifecycle()
             val dark = when (state.settings.theme) {
