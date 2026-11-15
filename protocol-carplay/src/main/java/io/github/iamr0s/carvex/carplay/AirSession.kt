@@ -1238,15 +1238,15 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      *  2. `carvex.artwork.transfer=0` → 退回"只出 id 不出图"的原行为。
      * 失败只作废这一张封面，控制会话（正在播放的媒体/视频/音频）不受影响。
      */
-    /** 5001 里"当前封面 = 这个传输 ID"的两种可能层级都发一遍，并各自记一行。 */
+    /**
+     * 5001 里"当前封面 = 这个传输 ID"。只发 group0 子参数这一种层级：
+     * 3.1 的数据证明加上顶层 0x1a 之后车机连"开始确认"(`[id]01`) 都不再回了，
+     * 而 group0 形状能拿回 `01`+`02`——顶层那条会把它弄没，已删。
+     */
     private fun announceArtwork(transferId:Byte,stage:String) {
         val child=IapWire.fields(listOf(0x1a to byteArrayOf(transferId)))
-        val grouped=runCatching{runtime.send(NowPlayingUpdate.ID,listOf(0 to child))}.getOrElse{false}
-        log("artwork announce $stage 5001 group0/0x1a id=$transferId sent=$grouped")
-        val top=runCatching{
-            runtime.send(NowPlayingUpdate.ID,listOf(0x1a to byteArrayOf(transferId)))
-        }.getOrElse{false}
-        log("artwork announce $stage 5001 top/0x1a id=$transferId sent=$top")
+        val sent=runCatching{runtime.send(NowPlayingUpdate.ID,listOf(0 to child))}.getOrElse{false}
+        log("artwork announce $stage 5001 group0/0x1a id=$transferId sent=$sent")
     }
 
     fun artwork(jpeg:ByteArray):Boolean {
@@ -1309,7 +1309,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // `iAP2MsgAddParam` 挂在一个先用 0x100067988(msg,0) 建出来的 param0 上——
             // 即 group0 的子参数；2.9 按这个层级发没出图，v55 改成顶层也没出图。
             // 对端对未知参数只是忽略，所以两条都发，覆盖两种解析路径，代价是多一条 11 字节消息。
-            announceArtwork(transferId,"after-start")
+            // 3.2 证明车机确实订阅了 group0 0x1a，但两种层级都发过一次仍不出图；
+            // 剩下的唯一时序变量是"报 ID"和"送数据"谁先。按传输 ID 奇偶交替，一次驾驶就能 A/B：
+            //   奇数 ID → 先报 ID 再建传输（pre）  偶数 ID → 先建传输再报 ID（post）
+            val ordering=if((transferId.toInt() and 1)==1)"pre" else "post"
+            log("artwork ordering=$ordering id=$transferId")
+            if(ordering=="pre")announceArtwork(transferId,"pre-start")
+            if(ordering=="post")announceArtwork(transferId,"post-start")
             var offset=0
             var sent=0
             while(offset<jpeg.size){
@@ -1336,7 +1342,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 " bytes="+jpeg.size)
             // iOS 的完成回调叫 _artworkFileTransferIDSent：ID 可能是在传送真正结束之后才作数，
             // 所以完成后再各发一遍同样两种层级。
-            announceArtwork(transferId,"after-complete")
+            announceArtwork(transferId,"post-complete")
         }
         return true
     }
