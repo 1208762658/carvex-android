@@ -1316,7 +1316,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
             log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
-                fileType=probeType,bufferId=0L)
+                fileType=probeType,bufferId=(transferId.toLong() and 0xff))
+            log("artwork start bufferId="+(transferId.toLong() and 0xff))
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
             var failure=sendArtworkPacket(sessionId,start)
@@ -1332,7 +1333,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // 3.2 证明车机确实订阅了 group0 0x1a，但两种层级都发过一次仍不出图；
             // 剩下的唯一时序变量是"报 ID"和"送数据"谁先。按传输 ID 奇偶交替，一次驾驶就能 A/B：
             //   奇数 ID → 先报 ID 再建传输（pre）  偶数 ID → 先建传输再报 ID（post）
-            val ordering=if((transferId.toInt() and 1)==1)"pre" else "post"
+            // 3.3 实测：pre 时车机 9ms 就回开始确认，post 要 1.2s 还差点超时；固定 pre。
+            val ordering="pre"
             log("artwork ordering=$ordering id=$transferId")
             if(ordering=="pre")announceArtwork(transferId,"pre-start")
             runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}

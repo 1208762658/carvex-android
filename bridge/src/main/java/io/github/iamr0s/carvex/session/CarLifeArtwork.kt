@@ -21,8 +21,12 @@ import java.net.URL
  */
 internal object CarLifeArtwork {
     /** 封面显示区很小，iPhone 也只发缩略图；256 边足够，且能让整张图落在几十个分块内。 */
-    private const val MAX_EDGE = 256
     private const val JPEG_QUALITY = 82
+    /** 4.0 起做尺寸对照：车机对封面尺寸有偏好（原生媒体区常见 600 起），
+     *  一张 256、一张 600 轮流发，一次驾驶就能看出"尺寸是不是门"。
+     *  两种都远低于 254KB 的单帧上限，也都在几十个分块之内。 */
+    private val edgeRotation = java.util.concurrent.atomic.AtomicInteger(0)
+    private fun nextMaxEdge(): Int = if (edgeRotation.getAndIncrement() and 1 == 0) 288 else 600
     /** 网络/文件读取上限：再大就不是封面了。 */
     private const val MAX_SOURCE_BYTES = 2 * 1024 * 1024
     private val ARTWORK_KEYS = listOf("cover", "artwork", "MediaAlbumArt", "MediaArtwork")
@@ -39,12 +43,13 @@ internal object CarLifeArtwork {
                 " looksJpeg=" + looksJpeg + " bytes=" + source.size)
             return if (looksJpeg) source else null
         }
-        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize(bounds) }
+        val maxEdge = nextMaxEdge()
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize(bounds, maxEdge) }
         val bitmap = BitmapFactory.decodeByteArray(source, 0, source.size, options) ?: run {
             log("artwork decode failed after bounds " + bounds.outWidth + "x" + bounds.outHeight)
             return null
         }
-        val scaled = scaleDown(bitmap)
+        val scaled = scaleDown(bitmap, maxEdge)
         val sentWidth = scaled.width
         val sentHeight = scaled.height
         val jpeg = ByteArrayOutputStream().also {
@@ -53,20 +58,20 @@ internal object CarLifeArtwork {
         if (scaled !== bitmap) bitmap.recycle()
         scaled.recycle()
         log("artwork normalized source=" + bounds.outWidth + "x" + bounds.outHeight +
-            " sent=" + sentWidth + "x" + sentHeight + " JPEG bytes=" + jpeg.size)
+            " sent=" + sentWidth + "x" + sentHeight + " maxEdge=" + maxEdge + " JPEG bytes=" + jpeg.size)
         return jpeg.takeIf { it.isNotEmpty() }
     }
 
-    private fun sampleSize(bounds: BitmapFactory.Options): Int {
+    private fun sampleSize(bounds: BitmapFactory.Options, maxEdge: Int): Int {
         var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_EDGE) sample *= 2
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxEdge) sample *= 2
         return sample
     }
 
-    private fun scaleDown(bitmap: Bitmap): Bitmap {
+    private fun scaleDown(bitmap: Bitmap, maxEdge: Int): Bitmap {
         val edge = maxOf(bitmap.width, bitmap.height)
-        if (edge <= MAX_EDGE) return bitmap
-        val ratio = MAX_EDGE.toFloat() / edge
+        if (edge <= maxEdge) return bitmap
+        val ratio = maxEdge.toFloat() / edge
         val width = (bitmap.width * ratio).toInt().coerceAtLeast(1)
         val height = (bitmap.height * ratio).toInt().coerceAtLeast(1)
         return Bitmap.createScaledBitmap(bitmap, width, height, true)
