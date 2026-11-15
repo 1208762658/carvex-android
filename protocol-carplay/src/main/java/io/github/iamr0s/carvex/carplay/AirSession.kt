@@ -1375,6 +1375,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // iOS 的完成回调叫 _artworkFileTransferIDSent：ID 可能是在传送真正结束之后才作数，
             // 所以完成后再各发一遍同样两种层级。
             announceArtwork(transferId,"post-complete")
+            // 关键：5001 是状态更新。之后每条标题/进度更新都必须继续带同一个 0x1a，
+            // 否则刚挂上的封面会被下一条更新清掉。
+            val stateful=runCatching{nowPlayingPublisher.artwork(transferId)}.getOrElse{false}
+            log("artwork state set id=$transferId sent=$stateful")
         }
         return true
     }

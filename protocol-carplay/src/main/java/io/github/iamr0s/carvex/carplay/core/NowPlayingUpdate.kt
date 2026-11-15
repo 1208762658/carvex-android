@@ -28,8 +28,11 @@ object NowPlayingUpdate {
         val repeatMode:Int?=null,val appName:String?=null,val mediaLibraryUid:String?=null,
         val itunesRadioAd:Boolean?=null,val itunesRadioStation:String?=null,
         val itunesRadioStationMediaPlaylistPersistentId:Long?=null,val playbackSpeed:Int?=null,
-        val setTimeElapsedAvailable:Boolean?=null,val appBundleId:String?=null)
-    val implemented=Selection((listOf(0,1,4,6,7,8,9,10,12,0x10,0x12,0x15,0x16,0x17,0x18,0x1b)
+        val setTimeElapsedAvailable:Boolean?=null,val appBundleId:String?=null,
+        /** 当前封面对应的文件传输 ID（group0 子参数 0x1a，1 字节）。
+         *  5001 是"状态"不是"事件"：每条更新都带同一个 ID，才不会把刚挂上的封面清掉。 */
+        val artworkTransferId:Byte?=null)
+    val implemented=Selection((listOf(0,1,4,6,7,8,9,10,12,0x10,0x12,0x15,0x16,0x17,0x18,0x1a,0x1b)
         .map{Attribute(0,it)}+listOf(0,1,2,3,4,5,6,7,8,9,10,0xb,0xc,0xd,0x10)
         .map{Attribute(1,it)}).toSet())
 
@@ -125,6 +128,7 @@ object NowPlayingUpdate {
         fun bool(group:Int,id:Int,value:Boolean?){value?.let{add(group,id,byteArrayOf(if(it)1 else 0))}}
         bool(0,0x15,track.isLikeSupported);bool(0,0x16,track.isBanSupported);bool(0,0x17,track.isLiked);bool(0,0x18,track.isBanned)
         u16(0,0x1b,track.chapterCount)
+        track.artworkTransferId?.let{add(0,0x1a,byteArrayOf(it))}
         track.status?.let{add(1,0,byteArrayOf(it.wire.toByte()))}
         track.elapsedMs?.let{add(1,1,IapWire.be32(it))}
         track.queueIndex?.let{add(1,2,IapWire.be32(it))}
@@ -177,6 +181,12 @@ class NowPlayingPublisher(private val emit:(List<Pair<Int,ByteArray>>)->Boolean)
             else->return false
         }
         return true
+    }
+    /** 封面传输完成后把 ID 记进状态并推一条更新：之后每条 5001 都会带着它。 */
+    @Synchronized fun artwork(id:Byte):Boolean {
+        if(!ready)return false
+        snapshot=snapshot.copy(artworkTransferId=id)
+        return send(snapshot)
     }
     /** `5003`：参数 0/1 是 U32（elapsed/queueIndex），参数 2 是 S32 startIndex（-1=自动）。
      *  三个都可缺；只有参数 2 且 5000 未声明 +0x51(startIndexOverride) 时返回 false。 */
