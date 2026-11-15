@@ -9,8 +9,22 @@ package io.github.iamr0s.carvex.carplay.core
  *
  *   `[transferId][type][body...]`
  *
+ * 类型由 `payload[1]` 的低 4 位决定（`0x10006de9c` 处的 `and w23, w24, #0xf`），
+ * 其中类型 4（建立）的字段位置来自同一函数的固定偏移读取：
+ *
+ *   偏移 0..1   = transferId / 类型
+ *   偏移 2..5   = 保留（对端不读）
+ *   偏移 6..9   = 文件总长，BE32
+ *   偏移 10..11 = 文件类型，取值 0..8（>8 直接进错误分支）
+ *   偏移 12..19 = 8 字节的 bufferID 一类
+ *   偏移 20..   = 文件名，NUL 结尾，最多 0x3c 字节
+ *
+ * 早先的 `[id][4][u64 总长]` 只有 10 字节，对端在偏移 10 读文件类型时越界拿到垃圾值，
+ * 直接落进"未知类型"分支——传输对象没被创建，后面所有数据块因此被静默丢弃。
+ * 所以建立包必须按上表铺满到文件名之后。
+ *
  * 三类操作（本实现只用到这三个）：
- *   - `4` 建立：正文是 u64 总长（大端），告诉对端这次要收多少字节；
+ *   - `4` 建立：按上表的完整字段布局；
  *   - `3` 数据：正文是本次分块；分块大小由调用方按会话 MTU 切，不能再套 CSM；
  *   - `5` 结束：没有正文。
  *
@@ -22,9 +36,30 @@ object ArtworkFileTransfer {
     const val TYPE_CHUNK=3
     const val TYPE_COMPLETE=5
 
-    fun start(transferId:Byte,totalBytes:Long):ByteArray {
-        require(totalBytes in 0..Long.MAX_VALUE)
-        return byteArrayOf(transferId,TYPE_START.toByte())+IapWire.be64(totalBytes)
+    /** 建立包里对端会当"文件类型"读走的枚举值；0..8 之外对端直接判错。 */
+    const val FILE_TYPE_ARTWORK=4
+    /** 文件名上限：对端只拷 0x3c 字节。 */
+    private const val NAME_LIMIT=0x3c
+
+    fun start(
+        transferId:Byte,
+        totalBytes:Long,
+        fileType:Int=FILE_TYPE_ARTWORK,
+        fileName:String="artwork.jpg"
+    ):ByteArray {
+        require(totalBytes in 0..0xffffffffL){"file-transfer size must fit BE32: $totalBytes"}
+        require(fileType in 0..8){"file type out of the peer's accepted range: $fileType"}
+        val name=fileName.take(NAME_LIMIT).toByteArray(Charsets.US_ASCII)
+        val head=java.io.ByteArrayOutputStream()
+        head.write(transferId.toInt())
+        head.write(TYPE_START)
+        head.write(ByteArray(4))                 // 2..5  保留
+        head.write(IapWire.be32(totalBytes))     // 6..9  总长
+        head.write(IapWire.be16(fileType))       // 10..11 文件类型
+        head.write(ByteArray(8))                 // 12..19 bufferID 一类
+        head.write(name)                         // 20..  文件名
+        head.write(0)                            // NUL 结尾
+        return head.toByteArray()
     }
 
     fun chunk(transferId:Byte,body:ByteArray):ByteArray {

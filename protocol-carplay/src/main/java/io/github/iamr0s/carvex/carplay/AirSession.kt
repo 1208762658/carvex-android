@@ -1250,7 +1250,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
-            var failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.start(transferId,jpeg.size.toLong()))
+            val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong())
+            log("artwork start datagram bytes="+start.size+" hex="+
+                start.joinToString(""){String.format("%02x",it)})
+            var failure=sendArtworkPacket(sessionId,start)
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
                 lastArtworkFingerprint.set(null)
