@@ -1189,7 +1189,9 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** 封面数据面单帧上限：远小于车机常规 2048 MTU，保证每块都在它的接收预算内。 */
     private val ARTWORK_MAX_FRAME_BYTES=1024
     /** 同一张封面在该窗口内不重发；超过就重发一次，避免"内容没变永远不发"。 */
-    private val ARTWORK_RESEND_MS=60_000L
+    private val ARTWORK_RESEND_MS=5_000L          // 探针版：5 秒就允许重发，尽快把 9 种文件类型跑一遍
+    /** 文件类型探针：每张封面换一个 fileType（0..8），日志里带出来，用来定位 866F 认哪一种。 */
+    private val artworkTypeProbe=java.util.concurrent.atomic.AtomicInteger(0)
     private val artworkTransferId=java.util.concurrent.atomic.AtomicInteger(0)
     private val lastArtworkFingerprint=java.util.concurrent.atomic.AtomicReference<String?>(null)
     @Volatile private var lastArtworkAtMs=0L
@@ -1277,7 +1279,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
-            val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong())
+            val probeType=artworkTypeProbe.getAndUpdate{old->if(old>=8)0 else old+1}
+            log("artwork start type=$probeType probe=true")
+            val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
+                fileType=probeType,bufferId=0L)
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
             var failure=sendArtworkPacket(sessionId,start)

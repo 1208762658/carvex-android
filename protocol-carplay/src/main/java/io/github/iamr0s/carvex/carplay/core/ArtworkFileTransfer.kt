@@ -45,7 +45,10 @@ object ArtworkFileTransfer {
         transferId:Byte,
         totalBytes:Long,
         fileType:Int=FILE_TYPE_ARTWORK,
-        fileName:String="artwork.jpg"
+        fileName:String="artwork.jpg",
+        /** 偏移 12..19 的 8 字节。iOS 侧 "Failed to allocate file transfer buffer ID!" 说明
+         *  这里填的是真实分配的 buffer ID；先按 0 试，探针版本用来 A/B。 */
+        bufferId:Long=0
     ):ByteArray {
         require(totalBytes in 0..0xffffffffL){"file-transfer size must fit BE32: $totalBytes"}
         require(fileType in 0..8){"file type out of the peer's accepted range: $fileType"}
@@ -56,7 +59,7 @@ object ArtworkFileTransfer {
         head.write(ByteArray(4))                 // 2..5  保留
         head.write(IapWire.be32(totalBytes))     // 6..9  总长
         head.write(IapWire.be16(fileType))       // 10..11 文件类型
-        head.write(ByteArray(8))                 // 12..19 bufferID 一类
+        head.write(IapWire.be64(bufferId))       // 12..19 bufferID 一类
         head.write(name)                         // 20..  文件名
         head.write(0)                            // NUL 结尾
         return head.toByteArray()
