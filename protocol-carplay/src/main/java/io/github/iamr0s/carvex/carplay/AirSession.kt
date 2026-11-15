@@ -1358,6 +1358,9 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     return@execute
                 }
                 offset=end;sent++
+                // 车机 ack 结束包只用 0~2ms，说明它只确认"收到了这一帧"，
+                // 真正的落盘/解码是之后异步做的。给它 20ms 的喘息窗口，避免 23 块在 100ms 内砸完。
+                if(sent%4==0)Thread.sleep(20)
                 if(sent==1||sent==chunkCount||sent%8==0)
                     log("artwork chunk progress "+sent+"/"+chunkCount+" bytes="+offset)
             }
@@ -1381,6 +1384,11 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // 否则刚挂上的封面会被下一条更新清掉。
             val stateful=runCatching{nowPlayingPublisher.artwork(transferId)}.getOrElse{false}
             log("artwork state set id=$transferId sent=$stateful")
+            // 车机可能是在我们报完 ID 之后才去解码的：补报两次，覆盖"晚渲染"。
+            repeat(2){n->
+                Thread.sleep(400)
+                announceArtwork(transferId,"reannounce"+(n+1))
+            }
         }
         return true
     }
