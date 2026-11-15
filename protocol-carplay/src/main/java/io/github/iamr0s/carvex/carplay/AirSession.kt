@@ -1186,7 +1186,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** Cache real metadata until this Link subscribes. False means no selected update was sent. */
     fun nowPlaying(track:NowPlayingUpdate.Track,replaceMedia:Boolean=false):Boolean =
         nowPlayingPublisher.update(track,replaceMedia)
+    /** 封面数据面单帧上限：远小于车机常规 2048 MTU，保证每块都在它的接收预算内。 */
+    private val ARTWORK_MAX_FRAME_BYTES=1024
     private val artworkTransferId=java.util.concurrent.atomic.AtomicInteger(0)
+    private val lastArtworkFingerprint=java.util.concurrent.atomic.AtomicReference<String?>(null)
     /** 封面是数据面工作：单独一条线程排队，绝不占事件线程，也不与控制会话的发送顺序混在一起。 */
     private val artworkSender=java.util.concurrent.Executors.newSingleThreadExecutor{task->
         Thread(task,"carvex-artwork").apply{isDaemon=true}
@@ -1225,9 +1228,22 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             log("artwork id ready but the peer proposed no kind1 (file-transfer) session; nothing sent")
             return false
         }
-        val mtu=runtime.maxSessionPacketBytes()
+        // 协商 MTU 在个别重同步里会冲到 65535（车机自己提的），照它切块会把整张 21KB 图
+        // 塞进一帧发出去——866F 的常规 MTU 只有 2048。这里给分块加一个保守上限，
+        // 片数多一点但每帧都在车机吃得住的大小内。
+        val negotiated=runtime.maxSessionPacketBytes()
+        val mtu=minOf(negotiated,ARTWORK_MAX_FRAME_BYTES)
         val perPacket=mtu-2
         if(perPacket<8){log("artwork transfer skipped: iAP session MTU too small mtu=$mtu");return false}
+        // CarWith 会隔几秒重发同一张封面。同一份字节没必要反复传：只在内容变化时发，
+        // 否则每次都在链路里刷 20 多 KB，既浪费窗口也淹没日志。
+        val fingerprint=java.security.MessageDigest.getInstance("SHA-256").digest(jpeg)
+            .joinToString(""){String.format("%02x",it)}
+        if(fingerprint==lastArtworkFingerprint.get()){
+            log("artwork unchanged fingerprint="+fingerprint.take(16)+"; skipped")
+            return false
+        }
+        lastArtworkFingerprint.set(fingerprint)
         val transferId=nextArtworkTransferId()
         val chunkCount=(jpeg.size+perPacket-1)/perPacket
         log("artwork transfer submitted session=$sessionId transferId=$transferId chunks=$chunkCount"+
@@ -1237,6 +1253,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             var failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.start(transferId,jpeg.size.toLong()))
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                lastArtworkFingerprint.set(null)
                 return@execute
             }
             // 建立成功之后再把 ID 写进 5001：车机此刻已经在等这条传输的内容。
@@ -1255,6 +1272,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 if(failure!=null){
                     log("artwork transfer abandoned at chunk="+sent+" offset="+offset+"/"+jpeg.size+
                         ": "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                    lastArtworkFingerprint.set(null)
                     return@execute
                 }
                 offset=end;sent++
@@ -1264,6 +1282,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
             if(failure!=null){
                 log("artwork transfer abandoned at complete: "+failure.javaClass.simpleName+" "+(failure.message?:""))
+                lastArtworkFingerprint.set(null)
                 return@execute
             }
             log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+

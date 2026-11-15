@@ -885,7 +885,15 @@ class IapLink(input:InputStream, private val output:OutputStream,
     }
     private fun deliver(f:IapWire.Frame){
         receiveSeq=f.seq
-        if(f.session!=control){log("Unsupported iAP session "+f.session);return}
+        if(f.session!=control){
+            // 业务会话（kind1 文件传输等）的入站帧：不再是"日志一行、直接丢"。
+            // 866F 每收到一次文件传输都在会话 2 上回两帧 2 字节，那正是它自己的应答/错误。
+            // 这里只做证据落盘（长度 + 原始字节），不转给控制消费者，避免污染 CSM 解析。
+            val bytes=f.payload
+            log("iAP session "+f.session+" inbound bytes="+bytes.size+
+                " hex="+(if(bytes.isEmpty())"<empty>" else bytes.joinToString(""){String.format("%02x",it)}))
+            return
+        }
         // A new link payload can finish a maximum-size CSM and already contain the next one.
         // Bound the accumulated byte window, then use each CSM total to retain its tail separately.
         require(partial.size()+f.payload.size<=65535+localMaxRxFrameBytes-10)
