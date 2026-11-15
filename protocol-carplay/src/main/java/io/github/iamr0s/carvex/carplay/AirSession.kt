@@ -1214,6 +1214,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private val artworkSender=java.util.concurrent.Executors.newSingleThreadExecutor{task->
         Thread(task,"carvex-artwork").apply{isDaemon=true}
     }
+    /** 封面"晚渲染"补报用的定时线程：不能让发送线程 sleep，否则会卡住下一张封面。 */
+    private val artworkReannouncer=java.util.concurrent.Executors.newSingleThreadScheduledExecutor{task->
+        Thread(task,"carvex-artwork-reannounce").also{it.isDaemon=true}
+    }
+    /** 交替实验：偶数 ID 不立即发结束包，等下一张封面到来时才补发，
+     *  让传输对象保持"接收中"状态，车机想过多久来读都能读到。 */
+    @Volatile private var deferredComplete:Pair<Int,Byte>?=null
     private fun nextArtworkTransferId():Byte {
         // 0 留给"没有传输"，其余循环使用；同一时刻只跑一条传输。
         val next=artworkTransferId.updateAndGet{value->if(value>=255)1 else value+1}
@@ -1313,6 +1320,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
+            // 下一张封面到来时，先把上一张"故意挂住"的传输收尾。
+            deferredComplete?.let{(sid,id)->
+                deferredComplete=null
+                val r=sendArtworkPacket(sid,ArtworkFileTransfer.complete(id))
+                log("artwork deferred complete flushed id=$id failure="+r)
+            }
             val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
             log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
@@ -1364,19 +1377,26 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 if(sent==1||sent==chunkCount||sent%8==0)
                     log("artwork chunk progress "+sent+"/"+chunkCount+" bytes="+offset)
             }
-            failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
+            val deferThis=(transferId.toInt() and 1)==0
+            failure=if(deferThis)null else sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
             if(failure!=null){
                 log("artwork transfer abandoned at complete: "+failure.javaClass.simpleName+" "+(failure.message?:""))
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
             val endAt=System.nanoTime()
-            val gotComplete=try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+            val gotComplete=if(deferThis)false else try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
                 catch(e:InterruptedException){Thread.currentThread().interrupt();false}
             log("artwork complete ack got=$gotComplete ms="+((System.nanoTime()-endAt)/1_000_000))
             pendingArtworkAck=null
-            log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
-                " bytes="+jpeg.size)
+            if((transferId.toInt() and 1)==0){
+                deferredComplete=sessionId to transferId
+                log("artwork complete deferred id=$transferId (next artwork will close it)")
+            }else{
+                deferredComplete=null
+                log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
+                    " bytes="+jpeg.size)
+            }
             // iOS 的完成回调叫 _artworkFileTransferIDSent：ID 可能是在传送真正结束之后才作数，
             // 所以完成后再各发一遍同样两种层级。
             announceArtwork(transferId,"post-complete")
@@ -1384,10 +1404,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // 否则刚挂上的封面会被下一条更新清掉。
             val stateful=runCatching{nowPlayingPublisher.artwork(transferId)}.getOrElse{false}
             log("artwork state set id=$transferId sent=$stateful")
-            // 车机可能是在我们报完 ID 之后才去解码的：补报两次，覆盖"晚渲染"。
-            repeat(2){n->
-                Thread.sleep(400)
-                announceArtwork(transferId,"reannounce"+(n+1))
+            // 真 iPhone 在 866F 上出图也是"延迟显示"，说明车机是过一会儿才去读/渲染的。
+            // 因此在 0.4s / 2.5s / 6s 各补报一次 ID，覆盖晚渲染窗口。
+            for((n,delay) in listOf(400L,2500L,6000L).withIndex()){
+                val id=transferId
+                artworkReannouncer.schedule({
+                    runCatching{announceArtwork(id,"reannounce"+(n+1))}
+                },delay,java.util.concurrent.TimeUnit.MILLISECONDS)
             }
         }
         return true
