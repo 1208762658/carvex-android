@@ -1328,9 +1328,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             }
             val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
             log("artwork start type=$probeType probe=done")
+            // A/B：奇数 ID 发 iOS "TypeData" 的 10 字节建立包（无文件名/类型/8 字节尾），
+            // 偶数 ID 发原来的 32 字节完整包。哪个能出图，一次就能分辨。
+            val shortStart=(transferId.toInt() and 1)!=0
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
-                fileType=probeType,bufferId=(transferId.toLong() and 0xff))
-            log("artwork start bufferId="+(transferId.toLong() and 0xff))
+                fileType=probeType,bufferId=(transferId.toLong() and 0xff),short=shortStart)
+            log("artwork start form="+(if(shortStart)"short10" else "full32")+
+                " bufferId="+(transferId.toLong() and 0xff))
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
             var failure=sendArtworkPacket(sessionId,start)
@@ -1377,7 +1381,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 if(sent==1||sent==chunkCount||sent%8==0)
                     log("artwork chunk progress "+sent+"/"+chunkCount+" bytes="+offset)
             }
-            val deferThis=(transferId.toInt() and 1)==0
+            val deferThis=false
             failure=if(deferThis)null else sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
             if(failure!=null){
                 log("artwork transfer abandoned at complete: "+failure.javaClass.simpleName+" "+(failure.message?:""))

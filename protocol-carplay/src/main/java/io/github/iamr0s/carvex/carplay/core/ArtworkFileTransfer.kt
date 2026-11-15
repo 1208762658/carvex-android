@@ -48,7 +48,10 @@ object ArtworkFileTransfer {
         fileName:String="artwork.jpg",
         /** 偏移 12..19 的 8 字节。iOS 侧 "Failed to allocate file transfer buffer ID!" 说明
          *  这里填的是真实分配的 buffer ID；先按 0 试，探针版本用来 A/B。 */
-        bufferId:Long=0
+        bufferId:Long=0,
+        /** iOS 走 `iAP2FileTransferTypeData`（"数据"而不是"文件"）时，Start 的长度只有 10：
+         *  即 `[id][4][保留 4B][总长 BE32]`，不带文件类型/8 字节尾/文件名。866F 也许只认同这一种。 */
+        short:Boolean=false
     ):ByteArray {
         require(totalBytes in 0..0xffffffffL){"file-transfer size must fit BE32: $totalBytes"}
         require(fileType in 0..8){"file type out of the peer's accepted range: $fileType"}
@@ -58,6 +61,7 @@ object ArtworkFileTransfer {
         head.write(TYPE_START)
         head.write(ByteArray(4))                 // 2..5  保留
         head.write(IapWire.be32(totalBytes))     // 6..9  总长
+        if(short)return head.toByteArray()
         head.write(IapWire.be16(fileType))       // 10..11 文件类型
         head.write(IapWire.be64(bufferId))       // 12..19 bufferID 一类
         head.write(name)                         // 20..  文件名
