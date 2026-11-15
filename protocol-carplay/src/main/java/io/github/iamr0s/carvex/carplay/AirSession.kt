@@ -161,6 +161,20 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             if(command.id==0x5003)nowPlayingPublisher.setInfo(requireNotNull(command.fields))
             else{
                 val subscribeFields=requireNotNull(command.fields)
+                if(command.id==NowPlayingUpdate.START){
+                    // 866F 只订阅它自己列出来的子项；把它们逐组打出来，才能对齐封面参数编号。
+                    val g0=subscribeFields.ordered.filter{it.first==0}.mapNotNull{runCatching{
+                        IapWire.parseFieldList(it.second)}.getOrNull()}.firstOrNull()?.ordered?.map{it.first}
+                    val g1=subscribeFields.ordered.filter{it.first==1}.mapNotNull{runCatching{
+                        IapWire.parseFieldList(it.second)}.getOrNull()}.firstOrNull()?.ordered?.map{it.first}
+                    val g2=subscribeFields.ordered.filter{it.first==2}.mapNotNull{runCatching{
+                        IapWire.parseFieldList(it.second)}.getOrNull()}.firstOrNull()?.ordered?.map{it.first}
+                    log("NowPlaying subscribe raw="+subscribeFields.ordered.joinToString("|"){
+                        String.format("%02x:",it.first)+it.second.joinToString(""){b->String.format("%02x",b)} })
+                    log("NowPlaying subscribe group0="+g0?.joinToString(","){String.format("0x%02x",it)})
+                    log("NowPlaying subscribe group1="+g1?.joinToString(","){String.format("0x%02x",it)})
+                    log("NowPlaying subscribe group2="+g2?.joinToString(","){String.format("0x%02x",it)})
+                }
                 nowPlayingPublisher.command(command.id,subscribeFields)
                 if(command.id==NowPlayingUpdate.START){
                     // VW-866F v14.2 (2026-11-02): v14 sent 0x4e0d immediately at CONTROL_READY;
@@ -1279,8 +1293,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
-            val probeType=artworkTypeProbe.getAndUpdate{old->if(old>=8)0 else old+1}
-            log("artwork start type=$probeType probe=true")
+            val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
+            log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
                 fileType=probeType,bufferId=0L)
             log("artwork start datagram bytes="+start.size+" hex="+
