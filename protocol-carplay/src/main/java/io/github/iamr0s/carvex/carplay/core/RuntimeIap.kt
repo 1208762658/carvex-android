@@ -137,6 +137,10 @@ class RuntimeIap(private val emit:(ByteArray)->Boolean,private val log:(String)-
     /** 单帧能装多少业务会话载荷。 */
     fun maxSessionPacketBytes():Int = link.maxSessionPacketBytes()
     /** 在指定业务会话上提交一帧数据面报文（不套 CSM）。 */
+    /** 转发给 IapLink：业务会话入站回调（封面传输等它的 [id]01/[id]02）。 */
+    var sessionInboundListener:((Int,ByteArray)->Unit)?
+        get()=link.sessionInboundListener
+        set(v){link.sessionInboundListener=v}
     fun sendSessionRaw(sessionId:Int,payload:ByteArray,completion:(Throwable?)->Unit={}):Boolean {
         if(closed.get()||degraded.get())return false
         return try{

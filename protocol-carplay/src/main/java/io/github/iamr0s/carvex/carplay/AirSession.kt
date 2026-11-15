@@ -1220,6 +1220,26 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         return next.toByte()
     }
     /** 发出的数据面帧要等链路 ACK 才算"进去了"：异步提交 + 有界等待。 */
+    /**
+     * 车机在会话 2 上回的 `[id]01` / `[id]02` 是它对本次文件传输的应答。
+     * 2.9 的时间线里这两帧是在我们把 16 块数据全轰完、并发出结束包之后才回来的
+     * （start .196 → chunks … → complete .224 → `01` .226 → `02` .359）：
+     * 也就是它在数据到齐之后才把传输对象建好，数据自然被丢掉。
+     * 现在改成真正等它：发完开始包，等 `01`，再送块，再等 `02`。
+     */
+    private class ArtworkAck(val id:Byte){
+        val start=java.util.concurrent.CountDownLatch(1)
+        val complete=java.util.concurrent.CountDownLatch(1)
+    }
+    @Volatile private var pendingArtworkAck:ArtworkAck?=null
+    private fun onArtworkInbound(sessionId:Int,bytes:ByteArray){
+        val ack=pendingArtworkAck?:return
+        if(bytes.size<2||bytes[0]!=ack.id)return
+        when(bytes[1].toInt() and 0x0f){
+            1->if(ack.start.count>0)ack.start.countDown()
+            2->if(ack.complete.count>0)ack.complete.countDown()
+        }
+    }
     private fun sendArtworkPacket(sessionId:Int,packet:ByteArray,timeoutMs:Long=8000):Throwable? {
         val done=java.util.concurrent.CountDownLatch(1)
         val failure=java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
@@ -1315,6 +1335,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             val ordering=if((transferId.toInt() and 1)==1)"pre" else "post"
             log("artwork ordering=$ordering id=$transferId")
             if(ordering=="pre")announceArtwork(transferId,"pre-start")
+            runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
+            val ack=ArtworkAck(transferId)
+            pendingArtworkAck=ack
+            val started=System.nanoTime()
+            val gotStart=try{ack.start.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+            log("artwork start ack got=$gotStart ms="+((System.nanoTime()-started)/1_000_000))
             if(ordering=="post")announceArtwork(transferId,"post-start")
             var offset=0
             var sent=0
@@ -1338,6 +1365,11 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
+            val endAt=System.nanoTime()
+            val gotComplete=try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+            log("artwork complete ack got=$gotComplete ms="+((System.nanoTime()-endAt)/1_000_000))
+            pendingArtworkAck=null
             log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
                 " bytes="+jpeg.size)
             // iOS 的完成回调叫 _artworkFileTransferIDSent：ID 可能是在传送真正结束之后才作数，

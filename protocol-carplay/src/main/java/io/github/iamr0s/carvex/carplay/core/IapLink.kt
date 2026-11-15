@@ -883,6 +883,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
             .filter{it !in seen}
             .toSet()
     }
+    /** 业务会话入站回调：封面文件传输要等车机的 `[id]01`/`[id]02` 应答才能继续。 */
+    @Volatile var sessionInboundListener:((Int,ByteArray)->Unit)?=null
     private fun deliver(f:IapWire.Frame){
         receiveSeq=f.seq
         if(f.session!=control){
@@ -890,6 +892,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
             // 866F 每收到一次文件传输都在会话 2 上回两帧 2 字节，那正是它自己的应答/错误。
             // 这里只做证据落盘（长度 + 原始字节），不转给控制消费者，避免污染 CSM 解析。
             val bytes=f.payload
+            sessionInboundListener?.invoke(f.session,bytes)
             log("iAP session "+f.session+" inbound bytes="+bytes.size+
                 " hex="+(if(bytes.isEmpty())"<empty>" else bytes.joinToString(""){String.format("%02x",it)}))
             return
