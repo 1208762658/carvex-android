@@ -1275,13 +1275,14 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
-            // 建立成功之后再把 ID 写进 5001：车机此刻已经在等这条传输的内容。
+            // 建立成功之后再把 ID 写进 5001。
+            // iOS 侧 0x100145e70 的证据：`iAP2MsgAddParam(msg, value, id=0x1a, len=1)`——
+            // 0x1a 是**顶层参数**，值就是 1 字节传输 ID；它不在 group0 里。2.9 那轮我们
+            // 把它塞进 group0 的子参数，对端按"媒体属性组里的未知子项"忽略，所以图没出来。
             val announced=runCatching{
-                runtime.send(NowPlayingUpdate.ID,listOf(
-                    0 to IapWire.fields(listOf(0x1a to byteArrayOf(transferId))))
-                )
+                runtime.send(NowPlayingUpdate.ID,listOf(0x1a to byteArrayOf(transferId)))
             }.getOrElse{false}
-            log("artwork announce 5001 group0/0x1a id=$transferId sent=$announced")
+            log("artwork announce 5001 top/0x1a id=$transferId sent=$announced")
             var offset=0
             var sent=0
             while(offset<jpeg.size){
