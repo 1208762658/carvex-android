@@ -1188,8 +1188,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         nowPlayingPublisher.update(track,replaceMedia)
     /** 封面数据面单帧上限：远小于车机常规 2048 MTU，保证每块都在它的接收预算内。 */
     private val ARTWORK_MAX_FRAME_BYTES=1024
+    /** 同一张封面在该窗口内不重发；超过就重发一次，避免"内容没变永远不发"。 */
+    private val ARTWORK_RESEND_MS=60_000L
     private val artworkTransferId=java.util.concurrent.atomic.AtomicInteger(0)
     private val lastArtworkFingerprint=java.util.concurrent.atomic.AtomicReference<String?>(null)
+    @Volatile private var lastArtworkAtMs=0L
+    @Volatile private var skipLoggedFor:String?=null
     /** 封面是数据面工作：单独一条线程排队，绝不占事件线程，也不与控制会话的发送顺序混在一起。 */
     private val artworkSender=java.util.concurrent.Executors.newSingleThreadExecutor{task->
         Thread(task,"carvex-artwork").apply{isDaemon=true}
@@ -1239,11 +1243,23 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // 否则每次都在链路里刷 20 多 KB，既浪费窗口也淹没日志。
         val fingerprint=java.security.MessageDigest.getInstance("SHA-256").digest(jpeg)
             .joinToString(""){String.format("%02x",it)}
-        if(fingerprint==lastArtworkFingerprint.get()){
-            log("artwork unchanged fingerprint="+fingerprint.take(16)+"; skipped")
+        // CarWith 每 2–4 秒就把同一首歌、同一张封面再递一次。原来"只要同内容就永久跳过"，
+        // 顺手每来一次打一行 skipped —— 2000 行环形缓冲十几分钟就被这类噪声刷满，
+        // 真正那次发送的证据被挤掉，日志等于白导。改成：
+        //   1) 同内容只在 ARTWORK_RESEND_MS 内跳过，之后允许重发一次（也顺便当探针用）；
+        //   2) 跳过这件事每张封面只记一行，不再刷屏。
+        val nowMs=android.os.SystemClock.elapsedRealtime()
+        if(fingerprint==lastArtworkFingerprint.get()&&nowMs-lastArtworkAtMs<ARTWORK_RESEND_MS){
+            if(skipLoggedFor!=fingerprint){
+                skipLoggedFor=fingerprint
+                log("artwork unchanged fingerprint="+fingerprint.take(16)+
+                    "; skipped until "+(ARTWORK_RESEND_MS/1000)+"s or a new cover")
+            }
             return false
         }
         lastArtworkFingerprint.set(fingerprint)
+        lastArtworkAtMs=nowMs
+        skipLoggedFor=null
         val transferId=nextArtworkTransferId()
         val chunkCount=(jpeg.size+perPacket-1)/perPacket
         log("artwork transfer submitted session=$sessionId transferId=$transferId chunks=$chunkCount"+

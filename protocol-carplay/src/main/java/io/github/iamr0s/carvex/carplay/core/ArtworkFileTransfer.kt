@@ -71,6 +71,14 @@ object ArtworkFileTransfer {
         byteArrayOf(transferId,TYPE_COMPLETE.toByte())
 
     /** 一次传输大致要发多少帧（建立 + 分块 + 结束），只用于日志与预算判断。 */
+    /** 分块正文长度：统一按调用方给的每帧上限切，且不跨过总长。 */
+    fun chunks(body:ByteArray,perPacket:Int):List<ByteArray> {
+        require(perPacket>0)
+        return (0 until body.size step perPacket).map{
+            body.copyOfRange(it,minOf(body.size,it+perPacket))
+        }
+    }
+
     fun packetCount(payloadBytes:Int,maxPacketBytes:Int):Int {
         require(maxPacketBytes>=3){"iAP session MTU too small for file transfer"}
         val perPacket=maxPacketBytes-2
