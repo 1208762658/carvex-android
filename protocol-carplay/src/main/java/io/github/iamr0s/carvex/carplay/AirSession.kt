@@ -1364,9 +1364,18 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // "传输对象没被创建"才是封面永远空白的根因。
             val probeType=2
             log("artwork start type=$probeType probe=done")
-            val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
-                fileType=probeType,bufferId=(transferId.toLong() and 0xff),fileName=fileName)
-            log("artwork start form=full32 bufferId="+(transferId.toLong() and 0xff)+" fileType=$probeType")
+            // 4.4 证明 type=2 已经是唯一可用的布局（车机对 2 的解析是"无文件名、无 bufferID"），
+            // 而 iOS 自身在"数据型"传输里用的是 10 字节短包：[id][4][4B][总长BE32]，不带类型/尾/名字。
+            // v72 起奇数张发 full32、偶数张发短包，单变量对照"布局"这一维。
+            val useShort=(transferId.toInt() and 1)==0
+            val start=if(useShort)
+                ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
+                    fileType=probeType,bufferId=0,fileName=fileName,short=true)
+            else
+                ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
+                    fileType=probeType,bufferId=(transferId.toLong() and 0xff),fileName=fileName)
+            log("artwork start form="+(if(useShort)"short10" else "full32")+
+                " bufferId="+(if(useShort)0L else (transferId.toLong() and 0xff))+" fileType=$probeType")
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
             // 3.6 证明 `[id]01` 是建立包的确认，不是"点单"：报号成功后车机并不主动取件。
