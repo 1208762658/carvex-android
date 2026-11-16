@@ -1285,7 +1285,27 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         return sent
     }
 
-    fun artwork(jpeg:ByteArray):Boolean {
+    /** 交替探针：奇数张发 JPEG，偶数张发 PNG，看车机认哪种编码。 */
+    private val artworkPngNext=java.util.concurrent.atomic.AtomicBoolean(false)
+
+    fun artwork(jpegIn:ByteArray):Boolean {
+        val usePng=artworkPngNext.get()
+        artworkPngNext.set(!usePng)
+        var jpeg=jpegIn
+        var fileName="artwork.jpg"
+        if(usePng){
+            val png=runCatching{
+                val bmp=android.graphics.BitmapFactory.decodeByteArray(jpegIn,0,jpegIn.size)
+                    ?: return@runCatching null
+                val out=java.io.ByteArrayOutputStream()
+                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG,100,out)
+                bmp.recycle()
+                out.toByteArray()
+            }.getOrNull()
+            if(png!=null&&png.isNotEmpty()){jpeg=png;fileName="artwork.png"}
+        }
+        log("artwork payload form="+(if(fileName.endsWith(".png"))"png" else "jpeg")+
+            " bytes="+jpeg.size+" name="+fileName)
         if(System.getProperty("carvex.artwork.transfer")?.trim()=="0"){
             log("artwork transfer disabled by carvex.artwork.transfer=0; id only")
             return false
@@ -1304,7 +1324,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         if(perPacket<8){log("artwork transfer skipped: iAP session MTU too small mtu=$mtu");return false}
         // CarWith 会隔几秒重发同一张封面。同一份字节没必要反复传：只在内容变化时发，
         // 否则每次都在链路里刷 20 多 KB，既浪费窗口也淹没日志。
-        val fingerprint=java.security.MessageDigest.getInstance("SHA-256").digest(jpeg)
+        val fingerprint=java.security.MessageDigest.getInstance("SHA-256").digest(jpegIn)
             .joinToString(""){String.format("%02x",it)}
         // CarWith 每 2–4 秒就把同一首歌、同一张封面再递一次。原来"只要同内容就永久跳过"，
         // 顺手每来一次打一行 skipped —— 2000 行环形缓冲十几分钟就被这类噪声刷满，
@@ -1345,7 +1365,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             val probeType=2
             log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
-                fileType=probeType,bufferId=(transferId.toLong() and 0xff))
+                fileType=probeType,bufferId=(transferId.toLong() and 0xff),fileName=fileName)
             log("artwork start form=full32 bufferId="+(transferId.toLong() and 0xff)+" fileType=$probeType")
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
