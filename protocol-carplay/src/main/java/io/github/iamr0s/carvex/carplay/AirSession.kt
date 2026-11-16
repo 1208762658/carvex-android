@@ -1328,40 +1328,28 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             }
             val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
             log("artwork start type=$probeType probe=done")
-            // A/B：奇数 ID 发 iOS "TypeData" 的 10 字节建立包（无文件名/类型/8 字节尾），
-            // 偶数 ID 发原来的 32 字节完整包。哪个能出图，一次就能分辨。
-            val shortStart=(transferId.toInt() and 1)!=0
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
-                fileType=probeType,bufferId=(transferId.toLong() and 0xff),short=shortStart)
-            log("artwork start form="+(if(shortStart)"short10" else "full32")+
-                " bufferId="+(transferId.toLong() and 0xff))
+                fileType=probeType,bufferId=(transferId.toLong() and 0xff))
+            log("artwork start form=full32 bufferId="+(transferId.toLong() and 0xff))
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
+            // 866F 是"先请求、后取件"：5001 只报取件码，图本体必须等它在会话 2 里点单
+            // （`[id]01`）之后才送。之前十几版都是先把建立包塞过去，等于没等它下单就发货。
+            log("artwork ordering=pull id=$transferId")
+            runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
+            val ack=ArtworkAck(transferId)
+            pendingArtworkAck=ack
+            announceArtwork(transferId,"pre-request")
+            val reqAt=System.nanoTime()
+            val gotRequest=try{ack.start.await(1500,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+            log("artwork request got=$gotRequest ms="+((System.nanoTime()-reqAt)/1_000_000))
             var failure=sendArtworkPacket(sessionId,start)
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
-            // 建立之后把 ID 写进 5001。两种层级都发：iOS 的 0x100145e70 里 0x1a 是
-            // `iAP2MsgAddParam` 挂在一个先用 0x100067988(msg,0) 建出来的 param0 上——
-            // 即 group0 的子参数；2.9 按这个层级发没出图，v55 改成顶层也没出图。
-            // 对端对未知参数只是忽略，所以两条都发，覆盖两种解析路径，代价是多一条 11 字节消息。
-            // 3.2 证明车机确实订阅了 group0 0x1a，但两种层级都发过一次仍不出图；
-            // 剩下的唯一时序变量是"报 ID"和"送数据"谁先。按传输 ID 奇偶交替，一次驾驶就能 A/B：
-            //   奇数 ID → 先报 ID 再建传输（pre）  偶数 ID → 先建传输再报 ID（post）
-            // 3.3 实测：pre 时车机 9ms 就回开始确认，post 要 1.2s 还差点超时；固定 pre。
-            val ordering="pre"
-            log("artwork ordering=$ordering id=$transferId")
-            if(ordering=="pre")announceArtwork(transferId,"pre-start")
-            runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
-            val ack=ArtworkAck(transferId)
-            pendingArtworkAck=ack
-            val started=System.nanoTime()
-            val gotStart=try{ack.start.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
-                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
-            log("artwork start ack got=$gotStart ms="+((System.nanoTime()-started)/1_000_000))
-            if(ordering=="post")announceArtwork(transferId,"post-start")
             var offset=0
             var sent=0
             while(offset<jpeg.size){
