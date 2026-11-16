@@ -70,9 +70,13 @@ internal object CarLifeArtwork {
         return sample
     }
 
+    /** 4.2/4.3 暴露的问题：CarWith 递过来的 cover 只有 250x250，
+     *  而 scaleDown 只会缩小、不会放大，于是 "maxEdge=600" 从来没生效过
+     *  （日志里 sent=250x250 maxEdge=600），尺寸这个变量等于没测。
+     *  改成双向缩放：小于目标边也放大到目标边，保证日志里的 sent 就是真实发出的尺寸。 */
     private fun scaleDown(bitmap: Bitmap, maxEdge: Int): Bitmap {
         val edge = maxOf(bitmap.width, bitmap.height)
-        if (edge <= maxEdge) return bitmap
+        if (edge == maxEdge) return bitmap
         val ratio = maxEdge.toFloat() / edge
         val width = (bitmap.width * ratio).toInt().coerceAtLeast(1)
         val height = (bitmap.height * ratio).toInt().coerceAtLeast(1)
