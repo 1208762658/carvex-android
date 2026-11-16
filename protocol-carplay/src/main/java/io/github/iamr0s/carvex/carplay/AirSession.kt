@@ -1338,7 +1338,11 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // v57 那次 0..8 全扫是在 bufferId=0 的无效状态下做的（车机连 01 都不给），结论作废。
             // 现在建立包已被正常接受，文件类型重新成为未验证变量：按封面依次换 0..8。
             // iOS artwork 路径调用 `iAP2FileTransferTypeData(record, 0)`，参数是 0。
-            val probeType=(transferId.toInt() and 0xff)%9
+            // 3.9 决定性证据：fileType=0..8 各试三轮，只有 2 能拿到 `[id]01`（3ms），
+            // 其余全部 1200ms 超时无确认；且 type=2 时结束包确认只要 2ms（其余 0ms 但传输对象没建起来）。
+            // 说明对端只把 2 当成可用的文件类型——之前所有版本填的 4 其实一直被拒，
+            // "传输对象没被创建"才是封面永远空白的根因。
+            val probeType=2
             log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
                 fileType=probeType,bufferId=(transferId.toLong() and 0xff))
