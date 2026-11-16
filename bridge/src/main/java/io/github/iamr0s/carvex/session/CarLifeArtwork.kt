@@ -21,12 +21,14 @@ import java.net.URL
  */
 internal object CarLifeArtwork {
     /** 封面显示区很小，iPhone 也只发缩略图；256 边足够，且能让整张图落在几十个分块内。 */
-    private const val JPEG_QUALITY = 82
+    private const val JPEG_QUALITY = 88
     /** 4.0 起做尺寸对照：车机对封面尺寸有偏好（原生媒体区常见 600 起），
      *  一张 256、一张 600 轮流发，一次驾驶就能看出"尺寸是不是门"。
      *  两种都远低于 254KB 的单帧上限，也都在几十个分块之内。 */
     private val edgeRotation = java.util.concurrent.atomic.AtomicInteger(0)
-    private fun nextMaxEdge(): Int = if (edgeRotation.getAndIncrement() and 1 == 0) 288 else 600
+    /** 4.0/4.1 里 288/600 轮流发都没出图，且都偏小；VW 原生媒体区常见 600 起，
+     *  4.2 起固定 600，把"尺寸"这个变量单独钉死，避免和编码对照混在一起。 */
+    private fun nextMaxEdge(): Int { edgeRotation.getAndIncrement(); return 600 }
     /** 网络/文件读取上限：再大就不是封面了。 */
     private const val MAX_SOURCE_BYTES = 2 * 1024 * 1024
     private val ARTWORK_KEYS = listOf("cover", "artwork", "MediaAlbumArt", "MediaArtwork")
