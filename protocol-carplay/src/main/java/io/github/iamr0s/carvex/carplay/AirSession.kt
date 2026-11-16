@@ -1270,10 +1270,19 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      * 3.1 的数据证明加上顶层 0x1a 之后车机连"开始确认"(`[id]01`) 都不再回了，
      * 而 group0 形状能拿回 `01`+`02`——顶层那条会把它弄没，已删。
      */
-    private fun announceArtwork(transferId:Byte,stage:String) {
+    private fun announceArtwork(transferId:Byte,stage:String):Boolean {
         val child=IapWire.fields(listOf(0x1a to byteArrayOf(transferId)))
-        val sent=runCatching{runtime.send(NowPlayingUpdate.ID,listOf(0 to child))}.getOrElse{false}
+        // 3.6 抓到过 sent=false：取件码根本没送出去，车机自然无从取件。
+        // 发送失败必须重试，否则"以为报了其实没报"。
+        var sent=false
+        for(attempt in 1..3){
+            sent=runCatching{runtime.send(NowPlayingUpdate.ID,listOf(0 to child))}.getOrElse{false}
+            if(sent)break
+            log("artwork announce $stage retry attempt=$attempt failed")
+            try{Thread.sleep(100)}catch(e:InterruptedException){Thread.currentThread().interrupt();break}
+        }
         log("artwork announce $stage 5001 group0/0x1a id=$transferId sent=$sent")
+        return sent
     }
 
     fun artwork(jpeg:ByteArray):Boolean {
@@ -1326,30 +1335,33 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 val r=sendArtworkPacket(sid,ArtworkFileTransfer.complete(id))
                 log("artwork deferred complete flushed id=$id failure="+r)
             }
-            val probeType=4   // v57 扫完 0..8 全不出图，类型不是门；固定回 4
+            // v57 那次 0..8 全扫是在 bufferId=0 的无效状态下做的（车机连 01 都不给），结论作废。
+            // 现在建立包已被正常接受，文件类型重新成为未验证变量：按封面依次换 0..8。
+            // iOS artwork 路径调用 `iAP2FileTransferTypeData(record, 0)`，参数是 0。
+            val probeType=(transferId.toInt() and 0xff)%9
             log("artwork start type=$probeType probe=done")
             val start=ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
                 fileType=probeType,bufferId=(transferId.toLong() and 0xff))
-            log("artwork start form=full32 bufferId="+(transferId.toLong() and 0xff))
+            log("artwork start form=full32 bufferId="+(transferId.toLong() and 0xff)+" fileType=$probeType")
             log("artwork start datagram bytes="+start.size+" hex="+
                 start.joinToString(""){String.format("%02x",it)})
-            // 866F 是"先请求、后取件"：5001 只报取件码，图本体必须等它在会话 2 里点单
-            // （`[id]01`）之后才送。之前十几版都是先把建立包塞过去，等于没等它下单就发货。
-            log("artwork ordering=pull id=$transferId")
+            // 3.6 证明 `[id]01` 是建立包的确认，不是"点单"：报号成功后车机并不主动取件。
+            // 所以回到 push：先报号，再建传输，再分块。
+            log("artwork ordering=pre id=$transferId")
             runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
             val ack=ArtworkAck(transferId)
             pendingArtworkAck=ack
-            announceArtwork(transferId,"pre-request")
-            val reqAt=System.nanoTime()
-            val gotRequest=try{ack.start.await(1500,java.util.concurrent.TimeUnit.MILLISECONDS)}
-                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
-            log("artwork request got=$gotRequest ms="+((System.nanoTime()-reqAt)/1_000_000))
+            announceArtwork(transferId,"pre-start")
             var failure=sendArtworkPacket(sessionId,start)
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
+            val started=System.nanoTime()
+            val gotStart=try{ack.start.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+            log("artwork start ack got=$gotStart ms="+((System.nanoTime()-started)/1_000_000))
             var offset=0
             var sent=0
             while(offset<jpeg.size){
