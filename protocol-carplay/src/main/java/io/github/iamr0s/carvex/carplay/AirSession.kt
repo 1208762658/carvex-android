@@ -1384,7 +1384,15 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
             val ack=ArtworkAck(transferId)
             pendingArtworkAck=ack
-            announceArtwork(transferId,"pre-start")
+            // 4.5 里 full32 + type2 依旧全绿却不出图。剩下唯一没动过的维度是报号时机：
+            // iOS 是先建 transfer、再把 0x1a 报给车机；而我们在建包之前就报了号，
+            // 车机可能先登记"这张封面等文件"，等不到就把它挂成空白。
+            // v73 起偶数张改成"只在传完之后报号"，奇数张维持现状做对照。
+            if((transferId.toInt() and 1)==0){
+                log("artwork announce skipped pre-start (post-only arm) id=$transferId")
+            }else{
+                announceArtwork(transferId,"pre-start")
+            }
             var failure=sendArtworkPacket(sessionId,start)
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
