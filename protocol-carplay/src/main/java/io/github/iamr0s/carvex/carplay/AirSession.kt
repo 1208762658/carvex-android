@@ -1367,7 +1367,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // 4.4 证明 type=2 已经是唯一可用的布局（车机对 2 的解析是"无文件名、无 bufferID"），
             // 而 iOS 自身在"数据型"传输里用的是 10 字节短包：[id][4][4B][总长BE32]，不带类型/尾/名字。
             // v72 起奇数张发 full32、偶数张发短包，单变量对照"布局"这一维。
-            val useShort=(transferId.toInt() and 1)==0
+            // 4.6 暴露：short10 走偶数、post-only 也走偶数，两个实验叠在一组，
+            // 结果偶数张全是"被拒的 short10 + 没报号"，等于什么都没测到。
+            // v74 起 short10 彻底停用（4.5/4.6 已证明它必被拒），奇偶只留给"报号时机"。
+            val useShort=false
             val start=if(useShort)
                 ArtworkFileTransfer.start(transferId,jpeg.size.toLong(),
                     fileType=probeType,bufferId=0,fileName=fileName,short=true)
