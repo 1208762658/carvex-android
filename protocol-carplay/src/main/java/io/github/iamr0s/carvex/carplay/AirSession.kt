@@ -1276,7 +1276,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      * 而 group0 形状能拿回 `01`+`02`——顶层那条会把它弄没，已删。
      */
     private fun announceArtwork(transferId:Byte,stage:String):Boolean {
-        val child=IapWire.fields(listOf(0x1a to byteArrayOf(transferId)))
+        // 规范里 MediaItemArtworkFileTransferIdentifier 是 uint8，但 866F 一直不出图。
+        // 若它内部按 uint16 取值，收到 1 字节参数会读成 0（或长度不匹配直接忽略），
+        // 表现就是"接收成功、永远空白"。v76 起偶数张改发 2 字节，奇数张维持 1 字节对照。
+        val wide=(transferId.toInt() and 1)==0
+        val param=if(wide)IapWire.be16(transferId.toInt() and 0xff) else byteArrayOf(transferId)
+        val child=IapWire.fields(listOf(0x1a to param))
         // 3.6 抓到过 sent=false：取件码根本没送出去，车机自然无从取件。
         // 发送失败必须重试，否则"以为报了其实没报"。
         var sent=false
@@ -1286,7 +1291,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             log("artwork announce $stage retry attempt=$attempt failed")
             try{Thread.sleep(100)}catch(e:InterruptedException){Thread.currentThread().interrupt();break}
         }
-        log("artwork announce $stage 5001 group0/0x1a id=$transferId sent=$sent")
+        log("artwork announce $stage 5001 group0/0x1a id=$transferId width="+(if(wide)"u16" else "u8")+
+            " param="+param.joinToString(""){String.format("%02x",it)}+" sent=$sent")
         return sent
     }
 
@@ -1396,11 +1402,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // iOS 是先建 transfer、再把 0x1a 报给车机；而我们在建包之前就报了号，
             // 车机可能先登记"这张封面等文件"，等不到就把它挂成空白。
             // v73 起偶数张改成"只在传完之后报号"，奇数张维持现状做对照。
-            if((transferId.toInt() and 1)==0){
-                log("artwork announce skipped pre-start (post-only arm) id=$transferId")
-            }else{
-                announceArtwork(transferId,"pre-start")
-            }
+            // 5.0 决定性证据：不先报号的偶数张（post-only 臂）start 全部 got=false ms=1200，
+            // 先报号的奇数张全部 got=true ms=2~3。说明车机只接受"它已经被通知过 ID"的建立包，
+            // 报号必须在 start 之前。v76 恢复为始终先报号。
+            announceArtwork(transferId,"pre-start")
             var failure=sendArtworkPacket(sessionId,start)
             if(failure!=null){
                 log("artwork transfer abandoned at start: "+failure.javaClass.simpleName+" "+(failure.message?:""))
