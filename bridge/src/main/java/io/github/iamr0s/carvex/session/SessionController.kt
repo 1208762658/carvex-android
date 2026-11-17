@@ -314,10 +314,21 @@ class SessionController(
                 // current adapter treats them as the 5001 u32 millisecond/index fields, but
                 // this unit mapping is an explicit local assumption until the same APK/vehicle
                 // pair confirms it. Reject values outside the wire range instead of truncating.
+                // CarWith 不给 persistentId，我们也就一直发 0——整段会话里车机看到的
+                // 永远是"同一个媒体项"。封面是按媒体项缓存/取回的，若它按 persistentId 记忆
+                // "这一项没有图"，后面的封面再成功也只有文字会变。这里按歌名+艺人派生一个
+                // 稳定 64 位 ID（同一首歌恒定，换歌即换），让每个媒体项有独立身份。
+                val titleText=NowPlayingUpdate.textOrNull(info.song)
+                val artistText=NowPlayingUpdate.textOrNull(info.artist)
+                val derivedId=java.security.MessageDigest.getInstance("SHA-256")
+                    .digest((titleText.orEmpty()+"\u0000"+artistText.orEmpty()).toByteArray())
+                    .let{ java.nio.ByteBuffer.wrap(it).long and 0x7fffffffffffffffL }
                 val track=NowPlayingUpdate.Track(
-                    title=NowPlayingUpdate.textOrNull(info.song),artist=NowPlayingUpdate.textOrNull(info.artist),
+                    title=titleText,artist=artistText,
                     durationMs=info.duration.takeIf{it in 1..0xffffffffL},
-                    queueIndex=info.index.toLong().takeIf{it>=0},queueCount=info.playlistSize.toLong().takeIf{it>0})
+                    queueIndex=info.index.toLong().takeIf{it>=0},queueCount=info.playlistSize.toLong().takeIf{it>0},
+                    persistentId=derivedId)
+                BridgeStore.log(id,"nowplaying persistentId="+derivedId+" title="+(titleText?:""))
                 latestMusic.set(track)
                 scope.launch(Dispatchers.IO){
                     runCatching{deliverMusic()}
