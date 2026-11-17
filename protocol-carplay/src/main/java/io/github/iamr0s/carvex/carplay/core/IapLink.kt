@@ -315,6 +315,14 @@ class IapLink(input:InputStream, private val output:OutputStream,
         return out.toString()
     }
     /** Payload bytes never enter logs: fragments may start inside a certificate or credential. */
+    /** 4.6 一次驾驶 7000+ 行，其中 iAP 逐帧 RX/TX 约 2400 行且全是数据面无 csm 的帧。
+     *  默认只保留带 csm 的控制面帧与异常帧；需要逐帧对齐时设 carvex.log.quiet=0。 */
+    private fun logFrame(dir:String,line:String){
+        val quiet=System.getProperty("carvex.log.quiet")?.trim()!="0"
+        if(quiet&&!line.contains("csm="))return
+        log("iAP frame "+dir+" "+line)
+    }
+
     private fun frameLine(f:IapWire.Frame):String {
         val p=f.payload
         val id=if(f.flags and 0xa0==0&&p.size>=6&&p[0]==0x40.toByte()&&p[1]==0x40.toByte()&&IapWire.u16(p,2)>=6)
@@ -331,7 +339,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
         check(!closed.get()){"iAP link closed"}
         val packet=IapWire.packet(f,packetVersion)
         require(packet.size<=localMaxTxFrameBytes)
-        log("iAP frame TX "+frameLine(f))
+        logFrame("TX",frameLine(f))
         output.write(packet); output.flush()
         // A data/ACK frame can carry the cumulative receive ACK as a piggyback.
         // Only clear a pending ACK after the bytes were accepted by the output;
@@ -574,7 +582,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
         while(true){
             val frame=next?:frames.read(localMaxRxFrameBytes)
             next=null;firstByteSeen=true
-            log("iAP frame RX "+frameLine(frame))
+            logFrame("RX",frameLine(frame))
             if((frame.flags==0x80||frame.flags==0xc0)&&frame.session==0)return frame
             when {
                 frame.flags==0x40&&frame.session==0&&frame.payload.isEmpty()->
@@ -621,7 +629,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
                     // Detection already cancelled the old timer and invalidated its epoch.
                     exchangeSynchronization(true,incomingFrame);return
                 }
-                log("iAP frame RX "+frameLine(incomingFrame))
+                logFrame("RX",frameLine(incomingFrame))
                 // An exact retransmitted SYNACK acknowledges the PREVIOUS proposal.
                 // Classify it before checking ACK against our newest PSN.
                 if(sameSynchronizationFrame(incomingFrame,accepted)){
@@ -649,7 +657,19 @@ class IapLink(input:InputStream, private val output:OutputStream,
                     exchangeSynchronization(false,budget=budget,resetInvalidAck=true)
                     return
                 }
-                require(incomingFrame.flags and 0x40!=0&&incomingFrame.ack==pending.frame.seq){"Unassociated SYN ACK"}
+                // 4.7 实测：车机在重协商里回的 c0 帧不一定 ACK 我们"最新"那次的 seq。
+                // 我们在 SYN 超时后发过 proposal#1/#2，车机 ACK 的是早一个 seq，
+                // 旧的 require 直接抛 Unassociated SYN ACK → 整条 iAP 被判 DEGRADED，
+                // 十秒后车机把控制通道关掉（4.7 里 EOF Truncated 0/2）。
+                // 这里只放宽"重协商帧"这一支：带 payload 的 c0 帧本来就自带完整会话表，
+                // 用它的表继续协商比按 seq 判死更接近车机的真实意图；
+                // 其它帧形态一律保持原来的 fail-closed，不做通用 ACK 容忍。
+                if(incomingFrame.flags and 0x80!=0&&incomingFrame.session==0&&incomingFrame.payload.isNotEmpty()){
+                    log("iAP renegotiation SYN ACK seq="+incomingFrame.seq+" ack="+incomingFrame.ack+
+                        " pendingSeq="+pending.frame.seq+" (ack mismatch tolerated)")
+                }else{
+                    require(incomingFrame.flags and 0x40!=0&&incomingFrame.ack==pending.frame.seq){"Unassociated SYN ACK"}
+                }
                 if(incomingFrame.flags and 0x80!=0){
                     require(incomingFrame.flags==0xc0&&incomingFrame.session==0&&incomingFrame.payload.isNotEmpty()){
                         "SYNC_RENEGOTIATION_REQUIRED"}
@@ -723,7 +743,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
             " session="+f.session+" len="+f.payload.size)
     }
     private fun receive(f:IapWire.Frame) {
-        log("iAP frame RX "+frameLine(f))
+        logFrame("RX",frameLine(f))
         if(f.flags==0x10){handleBareRst(f);return}
         require(f.flags and 0x08==0){"UNSUPPORTED_LINK_CONTROL: SLP"}
         if(f.flags and 0x20!=0){
@@ -1058,8 +1078,12 @@ class IapLink(input:InputStream, private val output:OutputStream,
             }
         }
         synchronized(ackLock){pendingSeq=-1}
-        log(if(session.kind==0)"iAP TX "+IapWire.u16(data,4).toString(16)
-            else "iAP TX session="+session.id+" kind="+session.kind+" bytes="+data.size+" (data plane)")
+        // 数据面每发一块就一行，4.6 里 764 行全是这个，把 artwork/ack 淹了。
+        // 分块进度另有 `artwork chunk progress` 覆盖；需要逐包还原时 carvex.log.quiet=0。
+        if(session.kind!=0&&System.getProperty("carvex.log.quiet")?.trim()=="0")
+            log("iAP TX session="+session.id+" kind="+session.kind+" bytes="+data.size+" (data plane)")
+        else if(session.kind==0)
+            log("iAP TX "+IapWire.u16(data,4).toString(16))
     }
     fun await(id:Int,seconds:Long=20):IapFields = synchronized(consumerLock) {
         val cached=synchronized(deferredLock){deferred.firstOrNull{it.id==id&&it.fields!=null}?.also{deferred.remove(it)}}

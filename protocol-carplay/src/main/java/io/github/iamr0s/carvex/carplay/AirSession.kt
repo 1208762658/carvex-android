@@ -113,6 +113,11 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private val hidLogSeen=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val iapEventSeen=java.util.concurrent.atomic.AtomicInteger(0)
     private fun logOnce(key:String,message:String){if(hidLogSeen.add(key))log(message)}
+    /** 逐帧心跳类日志默认不落盘（见 core/LogGate）；carvex.log.quiet=0 可恢复。 */
+    private fun logVerbose(message:String){
+        if(io.github.iamr0s.carvex.carplay.core.LogGate.dropPerFrame(message))return
+        log(message)
+    }
     /** 未知设备的"内容组合"（uuid+长度+末字节）去重集：与 logOnce 的键同源，但用于放行
      *  同一个设备的**不同**报告。没有它，首见去重会把 03→00→04→00 这一串全吞掉，
      *  而"按键不来"要看的就是这串变化。 */
@@ -583,7 +588,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // blocking cleanup on the control reader itself.
             control.onFailure={t->scope.launch{channelFailure("control-transport",t)}}
             control.onExchange={exchange->
-                log("Control exchange phase="+exchange.phase+" method="+exchange.method+" path="+exchange.path+" cseq="+exchange.cseq+
+                logVerbose("Control exchange phase="+exchange.phase+" method="+exchange.method+" path="+exchange.path+" cseq="+exchange.cseq+
                     " bodyBytes="+exchange.bodyBytes+" elapsedMs="+exchange.elapsedMs+
                     " lockWaitMs="+exchange.lockWaitMs+
                     (exchange.commandType?.let{" command="+it}?:"")+
@@ -946,7 +951,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 eo=RecordOutput(eo,Crypto.hkdf(it,"Events-Salt","Events-Read-Encryption-Key"))
             }
             scope.launch {
-                try{while(isActive){val r=RtspWire.read(ei);require(r.status==0){"${"Unexpected response on event connection status="}${r.status}"};val (status,b)=event(r,eventSiri);if(!r.headers.containsKey("cseq"))log("Event notification omitted CSeq; replying without synthetic sequence");RtspClient.reply(eo,r,status,b,allowMissingCSeq=true);eventReplied(r,status,b)}}
+                try{while(isActive){val r=RtspWire.read(ei);require(r.status==0){"${"Unexpected response on event connection status="}${r.status}"};val (status,b)=event(r,eventSiri);if(!r.headers.containsKey("cseq"))logVerbose("Event notification omitted CSeq; replying without synthetic sequence");RtspClient.reply(eo,r,status,b,allowMissingCSeq=true);eventReplied(r,status,b)}}
                 catch(t:Exception){if(isActive)channelFailure("event-reader",t)}
             }
         }else log("SETUP supplied no event channel; control request handler remains active")
@@ -1044,7 +1049,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         val path=r.first.split(' ').getOrNull(1)
         if(path=="/feedback")return 200 to byteArrayOf()
         if(path!="/command")return 400 to byteArrayOf()
-        log("RTSP event method="+r.first.substringBefore(" ")+" command="+(path=="/command")+" cseqPresent="+r.headers.containsKey("cseq")+" bodyBytes="+r.body.size)
+        logVerbose("RTSP event method="+r.first.substringBefore(" ")+" command="+(path=="/command")+" cseqPresent="+r.headers.containsKey("cseq")+" bodyBytes="+r.body.size)
         // Business dispatch is open only after verification and capability registration. A rejected command
         // body is not a broken transport and must receive a reply on this connection.
         return CommandBoundary.handle(r.body,{log(it)}){decoded->
@@ -1063,7 +1068,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // Every event the car sends leaves one observable line: for a message that is not mapped yet the
         // payload is the only evidence a later mapping can be built on, whether or not a branch below
         // handles its type.
-        log("OBSERVE rtsp command type="+(p["type"] as? String)+" payload="+summarize(p))
+        logVerbose("OBSERVE rtsp command type="+(p["type"] as? String)+" payload="+summarize(p))
         return synchronized(commandLock){when(p["type"]){
             "changeModes"->{
                 val params=p["params"] as? Map<*,*>?:return 400 to byteArrayOf()
