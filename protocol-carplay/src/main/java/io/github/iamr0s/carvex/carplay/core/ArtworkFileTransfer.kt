@@ -35,6 +35,10 @@ object ArtworkFileTransfer {
     const val TYPE_START=4
     const val TYPE_CHUNK=3
     const val TYPE_COMPLETE=5
+    // iOS 侧 `_iAP2FileTransferDelete` 对应线上的 type 6。iPhone 在新封面到来时
+    // 会先把上一张的传输 cancel 掉（日志串 `#Artwork %d: cancel previous transfer`），
+    // 即车机这一端只保留一个有效的封面传输槽。我们从来没做这一步。
+    const val TYPE_DELETE=6
 
     /** 建立包里对端会当"文件类型"读走的枚举值；0..8 之外对端直接判错。 */
     const val FILE_TYPE_ARTWORK=4
@@ -76,6 +80,9 @@ object ArtworkFileTransfer {
 
     fun complete(transferId:Byte):ByteArray =
         byteArrayOf(transferId,TYPE_COMPLETE.toByte())
+
+    fun cancel(transferId:Byte):ByteArray =
+        byteArrayOf(transferId,TYPE_DELETE.toByte())
 
     /** 一次传输大致要发多少帧（建立 + 分块 + 结束），只用于日志与预算判断。 */
     /** 分块正文长度：统一按调用方给的每帧上限切，且不跨过总长。 */

@@ -1297,6 +1297,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     }
 
     /** 交替探针：奇数张发 JPEG，偶数张发 PNG，看车机认哪种编码。 */
+    @Volatile private var lastArtworkTransferId:Byte? = null
     private val artworkPngNext=java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun artwork(jpegIn:ByteArray):Boolean {
@@ -1360,6 +1361,17 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
+            // iOS 在**新封面到来**时先把上一张的传输 cancel（日志串
+            // `#Artwork %d: cancel previous transfer: id=%d(%d) type=%d(%d) state=%d`），
+            // 也就是车机这一端只保留一个有效封面槽。我们一直只 start 不 cancel，
+            // 5.0/5.1 里那十几张封面都是"只建不收"地堆在会话 2 上（全部 state=9 挂着）。
+            // 若车机按单槽实现，堆叠的旧记录会让它认定的"当前封面"一直指向最早的空白项。
+            lastArtworkTransferId?.let{prev->
+                lastArtworkTransferId=null
+                val r=sendArtworkPacket(sessionId,ArtworkFileTransfer.cancel(prev))
+                log("artwork cancel previous id=$prev failure="+r)
+            }
+            lastArtworkTransferId=transferId
             // 下一张封面到来时，先把上一张"故意挂住"的传输收尾。
             deferredComplete?.let{(sid,id)->
                 deferredComplete=null
