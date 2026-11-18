@@ -317,6 +317,55 @@ class IapLink(input:InputStream, private val output:OutputStream,
     /** Payload bytes never enter logs: fragments may start inside a certificate or credential. */
     /** 4.6 一次驾驶 7000+ 行，其中 iAP 逐帧 RX/TX 约 2400 行且全是数据面无 csm 的帧。
      *  默认只保留带 csm 的控制面帧与异常帧；需要逐帧对齐时设 carvex.log.quiet=0。 */
+    // ---- 车机入站普查（v83） --------------------------------------------------
+    // 目的：搞清楚"车机在握手阶段到底主动发了什么"。5.3（20089）里
+    // 04:22:48 / 04:22:55 两次 Identify 与 04:22:55 的 messageFeatures=[22]
+    // 都说明车机在推进，但日志里看不到它对我们的"请求"明细。
+    // 这里对每条控制会话入站 CSM 记录：首次出现（带 hex 原文）、
+    // 是否为"请求"（命令字低 bit=0，即它不是对我们上一条的应答）、
+    // 以及相对同步完成的时刻。关闭链路时汇总一行 census。
+    private val inboundCensus = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    private val inboundSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    @Volatile private var lastAssocTxSeq = -1
+    @Volatile private var synchronizedAtMs = 0L
+
+    private fun sinceSync(): String {
+        val t = synchronizedAtMs
+        if (t == 0L) return "pre-sync"
+        return ((System.nanoTime() - t) / 1_000_000L).toString() + "ms since sync"
+    }
+
+    /** 车机主动发来的消息：首次必带 hex；同一命令字后续只记一行摘要。 */
+    private fun noteInbound(id: Int, body: ByteArray, f: IapWire.Frame) {
+        inboundCensus.merge(id, 1, Int::plus)
+        val first = inboundSeen.add(id)
+        val kind = if (id and 1 == 0) "request" else "reply"
+        val info = "ack=" + f.ack + " selfLast=" + lastAssocTxSeq + " " + sinceSync()
+        if (first) {
+            log("iAP peer NEW csm=" + id.toString(16) + " " + kind + " " + info +
+                " bytes=" + body.size + " hex=" + hexData(body))
+        } else if (id and 1 == 0 || id in surveyCsms) {
+            log("iAP peer msg csm=" + id.toString(16) + " " + kind + " " + info + " bytes=" + body.size)
+        }
+    }
+
+    private val surveyCsms = setOf(
+        0x1d00, 0x1d01, 0x1d02, 0x1d03, 0x1d04, 0x1d05, 0x1d06, 0x1d07,
+        0x4c00, 0x4c01, 0x4c02, 0x4c03, 0x4c04, 0x4c05, 0x4c06, 0x4c07, 0x4c08,
+        0x4e09, 0x4e0a, 0x4e0b, 0x4e0c, 0x4e0d, 0x4e0e, 0x4e0f,
+        0x5000, 0x5001, 0x5002, 0x5003,
+        0x5700, 0x5701, 0x5702, 0x5703,
+        0x6800, 0x6801, 0x6802, 0x6803,
+    )
+
+    private fun hexData(b: ByteArray): String {
+        val n = minOf(b.size, 64)
+        val text = StringBuilder(n * 2)
+        for (i in 0 until n) text.append(String.format("%02x", b[i]))
+        if (b.size > n) text.append("…(").append(b.size).append("B)")
+        return text.toString()
+    }
+
     private fun logFrame(dir:String,line:String){
         val quiet=System.getProperty("carvex.log.quiet")?.trim()!="0"
         if(quiet&&!line.contains("csm="))return
@@ -340,6 +389,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
         val packet=IapWire.packet(f,packetVersion)
         require(packet.size<=localMaxTxFrameBytes)
         logFrame("TX",frameLine(f))
+        if(f.flags and 0x40!=0)lastAssocTxSeq=f.seq
         output.write(packet); output.flush()
         // A data/ACK frame can carry the cumulative receive ACK as a piggyback.
         // Only clear a pending ACK after the bytes were accepted by the output;
@@ -705,7 +755,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
                     // 先落会话表，再发 ready 标记：ready 之后读表的人一定能看到业务会话。
                     negotiatedSessions=local.sessions
                     negotiatedControlSession=session
-                    log("iAP synchronized session="+control+" version="+controlVersion+" maxPacket="+maxPacket+
+                    synchronizedAtMs=System.nanoTime();log("iAP synchronized session="+control+" version="+controlVersion+" maxPacket="+maxPacket+
                         " proposals="+budget.proposals+" epoch="+handshakeEpoch)
                 }
                 return
@@ -934,6 +984,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
             if(all.size-at<n)break
             val id=IapWire.u16(all,at+4)
             val body=all.copyOfRange(at+6,at+n)
+            if(f.flags and 0xa0==0)runCatching{noteInbound(id,body,f)}
             // 先分类、再解析：载荷也可能是 iAP1 风格的 lingo 包，TLV 解析器吃不下它 ——
             // 之前正好是在这里抛异常，把整条 iAP 链路一起带下去。
             val lingo=IapMessageRouter.lingoMessage(body)
@@ -1119,6 +1170,10 @@ class IapLink(input:InputStream, private val output:OutputStream,
         }
         frames.close();runCatching{input.close()};runCatching{output.close()}
         synchronized(ackLock){ackTask?.cancel(false);ackTask=null;ackPending=false;txSlots.clear();pendingSeq=-1;ackLock.notifyAll()}
+        if(inboundCensus.isNotEmpty()){
+            log("iAP inbound census csm="+inboundCensus.entries.sortedBy{it.key}
+                .joinToString(","){(it.key.toString(16))+"\u00d7"+it.value})
+        }
         reader?.interrupt();asyncSender.shutdownNow();ackScheduler.shutdownNow();handshakeDeadline.shutdownNow()
     }
 }
