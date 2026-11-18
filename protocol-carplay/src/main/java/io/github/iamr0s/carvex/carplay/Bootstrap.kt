@@ -678,10 +678,17 @@ object Bootstrap {
                 if(identity.id.isEmpty())log("4e0e parameter 1 omitted: empty device UUID")
                 else add(1 to IapWire.cstring(identity.id))
             }
+            // 顺序按真 iPhone 抓包对齐（23G90 / `research/protocol/iap2_control_session/runtime/
+            // 23G90-bt-classic-2026-10-16.md` #16/#17）：**4E0D 先、4E0E 后**。
+            // Apple WWDC17-717 的重连流程是"车机先收到 wireless CarPlay enabled（4E0D），
+            // 再等设备被登记（4E0E 的 transport identifiers）"，反过来发会让车机在
+            // 无线开关还是未知状态时收到标识，不能据此把设备登记成 CarPlay 设备。
             val messages=listOf(0x4e09 to listOf(0 to IapWire.cstring(deviceName)),
                 0x4e0a to listOf(0 to IapWire.cstring("zh")),
-                0x4e0e to transportFields,
-                0x4e0d to listOf(0 to byteArrayOf(1)))
+                0x4e0d to listOf(0 to byteArrayOf(1)),
+                0x4e0e to transportFields)
+            log("[carvex.seamless] optional order = 4e09,4e0a,4e0d,4e0e (iPhone capture order); 4e0e content=" +
+                transportFields.joinToString(","){(id,value)->"param"+id+"="+value.size+"B"})
             messages.forEach{(id,fields)->if(id in received)send(id,fields)else log("Skip unadvertised "+id.toString(16))}
             if(identity.id.isNotEmpty())send(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
             else log("Skip 4e0c: empty device UUID")
