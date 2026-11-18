@@ -191,6 +191,15 @@ class SessionController(
             val pm=context.getSystemService(android.os.PowerManager::class.java)
             BridgeStore.log(id,"attempt start env: interactive="+pm?.isInteractive+" deviceIdle="+pm?.isDeviceIdleMode+" powerSave="+pm?.isPowerSaveMode)
         }
+        // 5.2 日志（2026-11-18 00:16/00:17/00:18）证明：attempt 一开跑时
+        // `wifi observation: wifi=absent ip=none (active=cellular)` —— 息屏后 WLAN 射频
+        // 根本不在关联状态。此时照样发起 RFCOMM，车机在 Wi-Fi 不可达的前提下先回
+        // `read failed... peer-rejected`（11.3s），再直接 `ACL_DISCONNECTED`；
+        // 之后 raw channel 1..6 的兜底全部无效。反之 Wi-Fi 已在的两次 attempt，
+        // `peer matched` 只要 0.29/0.48s，DETECT 零超时。
+        // 这里在蓝牙阶段之前先把 WLAN 预热到"有 IPv4"再连（最多等 8s，超时仍放行只记录，
+        // 不改变任何协议时序）。
+        WifiPreWarm.await(context,id,8_000)
         val failed=CompletableDeferred<Throwable>()
         val attemptJob=currentCoroutineContext().job
         val sessionScope=CoroutineScope(currentCoroutineContext())
