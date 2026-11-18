@@ -86,8 +86,6 @@ data class Settings(
     val startGate: Boolean = true,
     /** 被拉起后先等 N 秒再发起连接；0 表示不延时。 */
     val startDelaySec: Int = 0,
-    /** 无感连接实验：以 "iPhone" 身份上报（蓝牙名 + iAP 0x4e09 名），见 SeamlessIdentity。 */
-    val seamlessIphone: Boolean = true,
     /** Enable navigation and voice-assistant audio output; disabled by default while the path is diagnosed. */
 )
 

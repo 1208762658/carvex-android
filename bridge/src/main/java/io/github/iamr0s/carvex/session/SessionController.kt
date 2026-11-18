@@ -179,25 +179,6 @@ class SessionController(
         catch(t:Throwable){BridgeStore.log(id,"Local display unavailable: "+t.javaClass.simpleName+" "+(t.message?:""));null}
     }
     private fun reject(s:String){val id=BridgeStore.begin(0);BridgeStore.update(id){it.copy(stage=Stage.FAILED,detail=s,error=s)};BridgeStore.log(id,s)}
-    /**
-     * 无感连接实验：上报给车机的 iAP 设备名（0x4e09 参数 0）。
-     *
-     * 5.4（bee2bae1）实证：车机是在 04:54:50.088 **自己重启 iAP link** 后才进无线模式
-     * （`messageFeatures=[22] wifiAnnouncement=true`），我们先前发的 4e0d/4e0e/4300 无效。
-     * ⇒ 触发条件不在手机命令里，而在车机把我们归成哪类设备；866F 用蓝牙名归类。
-     * 所以这一版只改一个变量：上报名 = "iPhone"。开关在设置页（settings/seamless_iphone）。
-     */
-    private fun reportedName(id:String,o:Options):String{
-        val on=runCatching{
-            context.getSharedPreferences("settings",Context.MODE_PRIVATE).getBoolean("seamless_iphone",true)
-        }.getOrDefault(true)
-        if(!on){
-            BridgeStore.log(id,"[carvex.seamless] identity switch off; reporting host name \""+o.carPlayName+"\"")
-            return o.carPlayName
-        }
-        BridgeStore.log(id,"[carvex.seamless] identity=iPhone; iAP 0x4e09 name \"iPhone\" (host name \""+o.carPlayName+"\" suppressed)")
-        return "iPhone"
-    }
     private suspend fun attempt(id:String,o:Options,fromHost:Boolean):Unit=withContext(Dispatchers.IO) {
         val r=Resources{trace->
             BridgeStore.log(id,"Resource close type="+trace.type+" elapsedMs="+trace.elapsedMs+" error="+trace.error)
@@ -714,7 +695,7 @@ class SessionController(
             // The selected control schema owns the transaction order. Authentication failure
             // never retries another order or reuses the same socket's security state.
             var bootstrap=phase(Stage.AUTH,90000){
-                runner.negotiate(link,o.phoneMac,reportedName(id,o),identity,lastBootstrap,
+                runner.negotiate(link,o.phoneMac,o.carPlayName,identity,lastBootstrap,
                     experimentalIntegrityOnly=o.experiment,
                     networkHandoff=networkHandoff,
                     onNowPlayingCommand={command,fields->

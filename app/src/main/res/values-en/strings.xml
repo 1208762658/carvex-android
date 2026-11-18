@@ -101,9 +101,6 @@
     <string name="settings_connect_on_launch">Connect on launch</string>
     <string name="settings_start_gate">Wait for Bluetooth and Wi-Fi</string>
     <string name="settings_start_gate_supporting">Bluetooth is the hard condition; after it links up the gate gives Wi-Fi about 5 s to get an IPv4 lease, then connects anyway.</string>
-    <string name="settings_seamless_identity">Seamless connection</string>
-    <string name="settings_seamless_iphone">Report as iPhone</string>
-    <string name="settings_seamless_iphone_supporting">Report as iPhone (Bluetooth name + iAP name) so the head unit may start Apple CarPlay by itself instead of waiting for the CarPlay tile. Turn off to report the real phone name again.</string>
     <string name="settings_start_delay">Start delay</string>
     <string name="settings_keep_screen_on">Keep screen on</string>
     <string name="settings_scan_interval">Scan interval</string>

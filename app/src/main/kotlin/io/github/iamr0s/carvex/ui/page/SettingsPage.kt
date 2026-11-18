@@ -186,23 +186,6 @@ fun SettingsPage(
             }
         }
 
-        // 无感连接实验：把上报身份改成 iPhone（蓝牙名 + iAP 4e09 名）。
-        // 依据：5.4 里车机只在自己重启 iAP link 之后才进无线模式，而触发点不在我们的命令里。
-        SectionLabel(stringResource(R.string.settings_seamless_identity))
-        Panel {
-            SwitchRow(stringResource(R.string.settings_seamless_iphone), s.seamlessIphone) { v ->
-                vm.updateSettings("seamless_iphone=$v") { it.copy(seamlessIphone = v) }
-                // 改名要立刻生效：蓝牙名由 :app 的 SeamlessIdentity 在蓝牙状态变化时写入，
-                // 这里只落盘，下次拉起/蓝牙重开就会重写，避免在 UI 线程直接碰适配器。
-            }
-            Text(
-                stringResource(R.string.settings_seamless_iphone_supporting),
-                style = MaterialTheme.typography.bodySmall,
-                color = cs.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-            )
-        }
-
         // Slider
         Panel {
             var value by remember(s.scanIntervalSec) { mutableFloatStateOf(s.scanIntervalSec.toFloat()) }
