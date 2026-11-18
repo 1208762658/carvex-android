@@ -268,7 +268,10 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateSettings(label: String, change: (Settings) -> Settings) {
         val next = change(_state.value.settings).let {
-            it.copy(scanIntervalSec = it.scanIntervalSec.coerceIn(1, 60))
+            it.copy(
+                scanIntervalSec = it.scanIntervalSec.coerceIn(1, 60),
+                startDelaySec = it.startDelaySec.coerceIn(0, 30),
+            )
         }
         saveSettings(next)
         _state.update { it.copy(settings = next) }
@@ -300,6 +303,8 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         connectOnLaunch = prefs.getBoolean("launch", false),
         keepScreenOn = prefs.getBoolean("awake", true),
         scanIntervalSec = prefs.getInt("interval", 15).coerceIn(1, 60),
+        startGate = prefs.getBoolean("start_gate", true),
+        startDelaySec = prefs.getInt("start_delay", 0).coerceIn(0, 30),
         methods = prefs.getStringSet("methods", null)
             ?.mapNotNull { stored ->
                 // Settings contain only protocol/carrier ids, for example carplay-bluetooth.
@@ -321,6 +326,8 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
             .putBoolean("launch", s.connectOnLaunch)
             .putBoolean("awake", s.keepScreenOn)
             .putInt("interval", s.scanIntervalSec)
+            .putBoolean("start_gate", s.startGate)
+            .putInt("start_delay", s.startDelaySec)
             .putStringSet("methods", s.methods.map { it.mode.id }.toSet())
             .putString("theme", s.theme.name)
             .apply()

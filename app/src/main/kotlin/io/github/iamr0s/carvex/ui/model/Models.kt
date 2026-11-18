@@ -82,6 +82,10 @@ data class Settings(
     val methods: Set<Method> = setOf(Method.Bluetooth),
     val theme: ThemeMode = ThemeMode.System,
     val experimentalAuth: Boolean = false,
+    /** 启动前等"蓝牙已连 + Wi-Fi 已拿到 IPv4"再发起连接（见 bridge StartGate）。 */
+    val startGate: Boolean = true,
+    /** 被拉起后先等 N 秒再发起连接；0 表示不延时。 */
+    val startDelaySec: Int = 0,
     /** Enable navigation and voice-assistant audio output; disabled by default while the path is diagnosed. */
 )
 

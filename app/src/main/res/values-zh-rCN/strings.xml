@@ -97,6 +97,9 @@
     <string name="settings_device_name_supporting">其他设备会看到这个名称。</string>
     <string name="settings_auto_reconnect">自动重新连接</string>
     <string name="settings_connect_on_launch">启动时连接</string>
+    <string name="settings_start_gate">启动前等蓝牙与 Wi-Fi 就绪</string>
+    <string name="settings_start_gate_supporting">两者都已连接后再发起连接；等待超时仍会继续。</string>
+    <string name="settings_start_delay">延时启动连接</string>
     <string name="settings_keep_screen_on">保持屏幕常亮</string>
     <string name="settings_scan_interval">扫描间隔</string>
     <string name="seconds_short">%1$d 秒</string>

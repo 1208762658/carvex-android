@@ -145,6 +145,47 @@ fun SettingsPage(
             }
         }
 
+        // 启动时机：① 等蓝牙+Wi-Fi 就绪再连 ② 被拉起后延时 N 秒再连。
+        // 依据：息屏时 CarWith 刚拉起本应用、热点租约还没到位就发起 RFCOMM，
+        // 车机会 11s 后 peer-rejected 并断 ACL（见 StartGate 注释）。
+        SectionLabel(stringResource(R.string.settings_start_gate))
+        Panel {
+            SwitchRow(stringResource(R.string.settings_start_gate), s.startGate) { v ->
+                vm.updateSettings("start_gate=$v") { it.copy(startGate = v) }
+            }
+            Text(
+                stringResource(R.string.settings_start_gate_supporting),
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+            var delay by remember(s.startDelaySec) { mutableFloatStateOf(s.startDelaySec.toFloat()) }
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Row {
+                    Text(
+                        stringResource(R.string.settings_start_delay),
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        stringResource(R.string.seconds_short, delay.roundToInt()),
+                        color = cs.primary,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Slider(
+                    value = delay,
+                    onValueChange = { delay = it },
+                    valueRange = 0f..30f,
+                    steps = 29, // 0,1,...,30
+                    onValueChangeFinished = {
+                        val seconds = delay.roundToInt()
+                        vm.updateSettings("start_delay=${seconds}s") { it.copy(startDelaySec = seconds) }
+                    },
+                )
+            }
+        }
+
         // Slider
         Panel {
             var value by remember(s.scanIntervalSec) { mutableFloatStateOf(s.scanIntervalSec.toFloat()) }
