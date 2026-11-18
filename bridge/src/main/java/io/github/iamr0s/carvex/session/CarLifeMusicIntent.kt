@@ -57,6 +57,12 @@ internal object CarLifeMusicIntent {
         if (title == null && artist == null && album == null && app == null && duration == null && elapsed == null) {
             return null
         }
+        // CarWith 不给 persistentId，我们一直发 0，整段会话里车机看到的永远是"同一个媒体项"。
+        // 封面是按媒体项缓存/取回的：若它按 ID 记住"这一项没有图"，后面封面传得再成功也只有文字会变。
+        // 这里按歌名+艺人+专辑派生一个稳定 64 位 ID（同一首歌恒定，换歌即换）。
+        val derivedId = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(((title ?: "") + "\u0000" + (artist ?: "") + "\u0000" + (album ?: "")).toByteArray())
+            .let { java.nio.ByteBuffer.wrap(it).long and 0x7fffffffffffffffL }
         return NowPlayingUpdate.Track(
             title = NowPlayingUpdate.textOrNull(title),
             artist = NowPlayingUpdate.textOrNull(artist),
@@ -64,6 +70,7 @@ internal object CarLifeMusicIntent {
             durationMs = duration,
             elapsedMs = elapsed,
             appName = NowPlayingUpdate.textOrNull(app),
+            persistentId = derivedId,
         )
     }
 

@@ -358,7 +358,7 @@ class SessionController(
                         BridgeStore.log(id,"CarLife music Intent normalized for 5001: title="+
                             (parsed.title!=null)+" artist="+(parsed.artist!=null)+" album="+
                             (parsed.album!=null)+" duration="+(parsed.durationMs!=null)+
-                            " elapsed="+(parsed.elapsedMs!=null))
+                            " elapsed="+(parsed.elapsedMs!=null)+" persistentId="+parsed.persistentId)
                         // Intent payloads may be partial (for example progress-only); let the
                         // publisher merge them with its last accepted snapshot.
                         scope.launch(Dispatchers.IO){runCatching{deliverMusic(replaceMedia=false)}.onFailure{
