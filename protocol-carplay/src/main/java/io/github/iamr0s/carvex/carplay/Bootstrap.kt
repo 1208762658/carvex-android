@@ -671,12 +671,15 @@ object Bootstrap {
             if(optionalSent||!transactions.ready)return
             optionalSent=true
             handoffDeadline=System.nanoTime()+handoffWaitMs*1_000_000L
-            // 4e0e 参数 0 是蓝牙 MAC，参数 1 是设备唯一标识（C-0024 的 copyUniqueDeviceID 一解，
-            // 与 4e0c 同源）。标识为空时只发参数 0，并在日志里说明少发了哪一个。
+            // 4e0e 参数 0 是蓝牙 MAC（iPhone 抓包 18B=17字符+NUL）；参数 1 对齐 iPhone 的
+            // 序列号形态：23G90 抓包 param1=25B ⇒ 24 字符+NUL，而不是我们此前的 36 字符
+            // UUID。车机若按"序列号"形态入库，UUID 串永远无法归一，登记也就无从谈起。
+            // 用 MAC 十六进制双份拼接出 24 字符稳定串：不随会话变化，同一台手机恒定，
+            // 不需要持久化存储。
+            val serialIdentifier=phoneMac.replace(":","").uppercase().let{it+it}
             val transportFields=buildList{
                 add(0 to IapWire.cstring(phoneMac))
-                if(identity.id.isEmpty())log("4e0e parameter 1 omitted: empty device UUID")
-                else add(1 to IapWire.cstring(identity.id))
+                add(1 to IapWire.cstring(serialIdentifier))
             }
             // 顺序按真 iPhone 抓包对齐（23G90 / `research/protocol/iap2_control_session/runtime/
             // 23G90-bt-classic-2026-10-16.md` #16/#17）：**4E0D 先、4E0E 后**。
@@ -687,7 +690,7 @@ object Bootstrap {
                 0x4e0a to listOf(0 to IapWire.cstring("zh")),
                 0x4e0d to listOf(0 to byteArrayOf(1)),
                 0x4e0e to transportFields)
-            log("[carvex.seamless] optional order = 4e09,4e0a,4e0d,4e0e (iPhone capture order); 4e0e content=" +
+            log("[carvex.866f] optional order = 4e09,4e0a,4e0d,4e0e (iPhone capture order); 4e0e content=" +
                 transportFields.joinToString(","){(id,value)->"param"+id+"="+value.size+"B"})
             messages.forEach{(id,fields)->if(id in received)send(id,fields)else log("Skip unadvertised "+id.toString(16))}
             if(identity.id.isNotEmpty())send(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
