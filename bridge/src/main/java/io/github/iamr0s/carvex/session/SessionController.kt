@@ -61,6 +61,8 @@ class SessionController(
     @Volatile private var host:CastHost?=null
     @Volatile private var audioBridge:HostAudioBridge?=null
     @Volatile private var activeAir:AirSession?=null
+    /** 当前会话的导航下行入口；会话结束即置空，避免把旧快照发给下一次连接。 */
+    private val navPush=java.util.concurrent.atomic.AtomicReference<((NavigationSnapshot)->Unit)?>(null)
     @Volatile private var micQueryLogged=false
     /** Wi-Fi parameters from the last successful handshake: a retry reuses them instead of asking the
      *  accessory again, and a re-handshake can tell from them that nothing changed. */
@@ -253,15 +255,44 @@ class SessionController(
         fun deliverMusic(replaceMedia:Boolean=true){synchronized(musicLock){
             if(!ended.get())latestMusic.get()?.let{musicAir.get()?.nowPlaying(it,replaceMedia=replaceMedia)}
         }}
-        fun deliverNavigation(fields:List<Pair<Int,ByteArray>>){
+        // 导航下行：5201（路线/剩余距离）+ 按需的 5202（机动点）。两者都只在车机订阅过
+        // 5200 之后才发；未标定的枚举保持缺席，日志必须能回答"发没发、发了什么"。
+        fun pushSnapshot(s:NavigationSnapshot){
             if(ended.get())return
-            val air=musicAir.get() ?: return
-            if(!NavigationGuidance.active)return
+            val air=musicAir.get()?:run{BridgeStore.log(id,"[carvex.nav] push dropped: no AirPlay session");return}
+            if(!NavigationGuidance.active){BridgeStore.log(id,"[carvex.nav] push dropped: 5200 subscription inactive");return}
+            val components=NavigationGuidance.components.ifEmpty{listOf(1)}
+            val maneuverType=s.maneuverType
+            val route=NavigationGuidance.route(NavigationGuidance.RouteUpdate(
+                components=components,
+                state=s.state,
+                currentRoad=s.road?.takeIf{it.isNotEmpty()},
+                distanceRemaining=s.remainMeters?.toLong()?.takeIf{it>=0},
+                distanceDisplay=s.remainText(),
+                distanceUnits=s.distanceUnits,
+                maneuverList=if(maneuverType!=null)listOf(0) else emptyList(),
+                maneuverCount=if(maneuverType!=null)1 else null,
+                beingShown=true))
             scope.launch(Dispatchers.IO){
-                if(!air.navigationRouteUpdate(fields))
-                    BridgeStore.log(id,"navigation 5201 update not sent")
+                val routeSent=air.navigationRouteUpdate(route)
+                BridgeStore.log(id,"[carvex.nav] 5201 sent=$routeSent road=${s.road?:"-"} remain=${s.remainMeters?.toString()?:"-"} display=${s.remainText()?:"-"} state=${s.state?.toString()?:"-"}")
+                if(maneuverType==null){
+                    BridgeStore.log(id,"[carvex.nav] 5202 skipped: maneuver type not calibrated")
+                    return@launch
+                }
+                val maneuver=NavigationGuidance.maneuver(NavigationGuidance.ManeuverUpdate(
+                    components=components,
+                    index=0,
+                    type=maneuverType,
+                    afterRoad=s.road?.takeIf{it.isNotEmpty()},
+                    distance=s.toManeuverMeters?.toLong()?.takeIf{it>=0},
+                    distanceDisplay=s.maneuverText(),
+                    distanceUnits=s.distanceUnits))
+                val maneuverSent=air.navigationManeuverUpdate(maneuver)
+                BridgeStore.log(id,"[carvex.nav] 5202 sent=$maneuverSent type=$maneuverType to=${s.toManeuverMeters?.toString()?:"-"} display=${s.maneuverText()?:"-"}")
             }
         }
+        navPush.set(::pushSnapshot)
         // Speech output activity is not proof that recognition is listening or has ended.
         // VoiceButtonToggle keeps local accepted requests until a verified host state is available.
         val heldKeys=mutableMapOf<Int,Long>()
@@ -355,15 +386,12 @@ class SessionController(
                     "carlife_show_hud_info"->{
                         val road=intent.getStringExtra("road_name")?:""
                         val remain=intent.getIntExtra("remain_distance",-1)
-                        val components=NavigationGuidance.components
                         BridgeStore.update(id){it.copy(hostHud="${"kind="}${intent.getIntExtra("action",0)}${" turn="}${intent.getIntExtra("navi_turn",0)}${" remains="}${remain}${" total="}${intent.getIntExtra("total_distance",0)}${" road="}${road}")}
-                        // Only fields whose CarWith names match the frozen firmware schema are
-                        // translated. Product-specific action/turn enums stay diagnostic until
-                        // their numeric mapping is captured from the same APK/vehicle pair.
-                        val routeValues=NavigationGuidance.route(NavigationGuidance.RouteUpdate(
-                            components=components,currentRoad=road.takeIf{it.isNotEmpty()},
-                            distanceRemaining=remain.toLong().takeIf{it>=0}))
-                        if(routeValues.isNotEmpty())deliverNavigation(routeValues)
+                        // 只翻译语义已确认的字段：路名与剩余距离。action/navi_turn/total_distance
+                        // 仍保留为诊断串——它们的枚举在固件上未标定，猜错会让仪表显示错箭头。
+                        pushSnapshot(NavigationSnapshot(
+                            road=road.takeIf{it.isNotEmpty()},
+                            remainMeters=remain.takeIf{it>=0}))
                     }
                     "carlife_change_theme"->{
                         val mode=intent.getIntExtra("mode",-1)
@@ -1072,7 +1100,7 @@ class SessionController(
             cleanup.close()
             withContext(NonCancellable){cleanup.awaitClosed()}
             if(termination===cleanup)termination=null
-            if(host===h)host=null;if(audioBridge===audio)audioBridge=null;activeAir=null
+            if(host===h)host=null;if(audioBridge===audio)audioBridge=null;activeAir=null;navPush.set(null)
             BridgeStore.log(id,"session resources released")
         }
     }
@@ -1111,6 +1139,11 @@ class SessionController(
             catch(t:Exception){BridgeStore.log(id,"${"CarWith audio probe failed: "}${t.javaClass.simpleName}${" "}${t.message?:""}");BridgeStore.update(id){it.copy(carWithAudioProbeStatus="测试失败："+(t.message?:t.javaClass.simpleName))}}
             finally{BridgeStore.update(id){it.copy(carWithAudioProbeRunning=false)}}
         }
+    }
+    override fun pushNavigation(road:String?,remainMeters:Int?,toManeuverMeters:Int?,maneuverType:Int?,state:Int?,distanceUnits:Int?){
+        val push=navPush.get()
+        if(push==null){BridgeStore.log(BridgeStore.state.value.id,"[carvex.nav] push ignored: no active session");return}
+        push(NavigationSnapshot(road,remainMeters,toManeuverMeters,maneuverType,state,distanceUnits))
     }
     override fun toggleCarPlayAudioTest(){
         val current=carPlayAudioTestJob
