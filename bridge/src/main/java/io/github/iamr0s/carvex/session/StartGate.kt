@@ -53,6 +53,10 @@ internal object StartGate {
         return value.coerceIn(0, MAX_DELAY_SEC)
     }
 
+    /** 蓝牙就绪后额外等 Wi-Fi 租约的窗口。5.3：Wi-Fi 常常在会话建立之后才到。 */
+    fun wifiWaitMs(): Long =
+        sysProp("carvex.startGate.wifiWaitMs", "").toLongOrNull()?.coerceIn(0L, 30_000L) ?: 5_000L
+
     private fun timeoutMs(): Long =
         sysProp("carvex.startGate.timeoutMs", "").toLongOrNull()?.coerceIn(1_000L, 60_000L)
             ?: DEFAULT_TIMEOUT_MS
@@ -108,26 +112,39 @@ internal object StartGate {
                 (if (fromHost) "" else " (manual attempt)"))
             return
         }
+        // 5.3device-log.txt（20089，2026-11-18 04:22）证明：ACL 已在连接态时，
+        // 即使 wifi=not-wifi，RFCOMM 也是 92ms 内 peer matched、iAP 全链路正常；
+        // 而 Wi-Fi 要到 +26s 才 available（CarWith 连热点在会话建立之后才完成），
+        // 之后由 handoff 切到无线 CarPlay。5.2 里失败那次开头根本没有 ACL_CONNECTED，
+        // 是"蓝牙还没连上就发 RFCOMM"被车机 11.3s 后 peer-rejected。
+        // 所以判据分硬软两级：蓝牙 ACL = 硬条件（最多等 15s）；Wi-Fi 租约 = 软条件（再等 5s）。
         val started = SystemClock.elapsedRealtime()
-        val deadline = started + timeoutMs()
+        var btReadyAt = 0L
         var lastLabel: String? = null
         while (true) {
+            val now = SystemClock.elapsedRealtime()
             val (bt, btLabel) = bluetoothState(context, target)
+            if (btReadyAt == 0L && bt) btReadyAt = now
             val (wifi, wifiLabel) = wifiState(context)
             if (bt && wifi) {
-                BridgeStore.log(id, "start gate: ready bt=$btLabel wifi=$wifiLabel waitedMs=" +
-                    (SystemClock.elapsedRealtime() - started))
+                BridgeStore.log(id, "start gate: ready bt=$btLabel wifi=$wifiLabel waitedMs=" + (now - started))
                 return
             }
             val label = "bt=$btLabel wifi=$wifiLabel"
             if (label != lastLabel) {
                 lastLabel = label
-                BridgeStore.log(id, "start gate: waiting $label waitedMs=" +
-                    (SystemClock.elapsedRealtime() - started))
+                BridgeStore.log(id, "start gate: waiting $label waitedMs=" + (now - started))
             }
-            if (SystemClock.elapsedRealtime() >= deadline) {
+            val hardDeadline = started + timeoutMs()
+            val softDeadline = if (btReadyAt != 0L) btReadyAt + wifiWaitMs() else Long.MAX_VALUE
+            if (now >= hardDeadline && !bt) {
                 BridgeStore.log(id, "start gate: timeout after " + timeoutMs() + "ms $label" +
-                    "; proceeding anyway (5.2 evidence: car drops ACL when WLAN is absent)")
+                    "; proceeding anyway (5.2: car rejects RFCOMM when the ACL was never up)")
+                return
+            }
+            if (now >= softDeadline) {
+                BridgeStore.log(id, "start gate: wifi not ready after " + wifiWaitMs() + "ms $label" +
+                    "; proceeding (5.3: handshake succeeds without WLAN, car joins later)")
                 return
             }
             delay(POLL_MS)
