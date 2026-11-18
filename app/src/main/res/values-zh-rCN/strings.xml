@@ -99,6 +99,9 @@
     <string name="settings_connect_on_launch">启动时连接</string>
     <string name="settings_start_gate">启动前等蓝牙与 Wi-Fi 就绪</string>
     <string name="settings_start_gate_supporting">蓝牙是硬条件；蓝牙连上后再最多等约 5 秒的 Wi-Fi 租约，等不到也会继续连接。</string>
+    <string name="settings_seamless_identity">无感连接</string>
+    <string name="settings_seamless_iphone">以上报 iPhone 身份</string>
+    <string name="settings_seamless_iphone_supporting">以 iPhone 的身份上报（蓝牙名 + iAP 名），让车机有可能自己启动 Apple CarPlay，而不是等你点车机上的 CarPlay 图标。关掉即恢复上报真实手机名。</string>
     <string name="settings_start_delay">延时启动连接</string>
     <string name="settings_keep_screen_on">保持屏幕常亮</string>
     <string name="settings_scan_interval">扫描间隔</string>

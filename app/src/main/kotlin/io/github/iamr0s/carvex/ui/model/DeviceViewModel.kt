@@ -305,6 +305,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         scanIntervalSec = prefs.getInt("interval", 15).coerceIn(1, 60),
         startGate = prefs.getBoolean("start_gate", true),
         startDelaySec = prefs.getInt("start_delay", 0).coerceIn(0, 30),
+        seamlessIphone = prefs.getBoolean("seamless_iphone", true),
         methods = prefs.getStringSet("methods", null)
             ?.mapNotNull { stored ->
                 // Settings contain only protocol/carrier ids, for example carplay-bluetooth.
@@ -328,6 +329,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
             .putInt("interval", s.scanIntervalSec)
             .putBoolean("start_gate", s.startGate)
             .putInt("start_delay", s.startDelaySec)
+            .putBoolean("seamless_iphone", s.seamlessIphone)
             .putStringSet("methods", s.methods.map { it.mode.id }.toSet())
             .putString("theme", s.theme.name)
             .apply()

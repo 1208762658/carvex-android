@@ -72,6 +72,7 @@ object WiapSourcePublisher {
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
                 BluetoothAdapter.STATE_ON -> {
                     BridgeStore.log("", "Persistent WiAP source: Bluetooth ON, (re)registering records")
+                    runCatching { applyIdentity(context) }
                     ensureActive(context)
                 }
                 BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF ->
@@ -93,7 +94,18 @@ object WiapSourcePublisher {
         runCatching { BleTopologyProbe.start(app) }
         // 车机蓝牙一有活动就扫一轮，抓"刚开机/开门"那个广播窗口。
         runCatching { BleTopologyProbe.watchCarActivity(app) }
+        runCatching { applyIdentity(app) }
         ensureActive(app)
+    }
+
+    /** 无感连接实验：把本机蓝牙名改成 iPhone（见 [SeamlessIdentity]）。异常一律吞掉。 */
+    private fun applyIdentity(context: Context) {
+        runCatching {
+            val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
+            SeamlessIdentity.applyBluetoothName(context.applicationContext, adapter)
+        }.onFailure {
+            BridgeStore.log("", "[carvex.seamless] identity step skipped: ${it.javaClass.simpleName}: ${it.message}")
+        }
     }
 
     /**
