@@ -265,6 +265,9 @@ class SessionController(
         val musicLock=Any()
         val latestMusic=AtomicReference<NowPlayingUpdate.Track?>(null)
         val musicAir=AtomicReference<AirSession?>(null)
+        // v92(20106) 封面稳定闸状态：(上次提交时刻, 上次提交字节)。仅存于单会话作用域，
+        // 会话结束自动作废；读写在 artwork IO 协程内串行发生，无需额外锁。
+        val artworkGate=AtomicReference<Pair<Long,ByteArray>?>(null)
         fun deliverMusic(replaceMedia:Boolean=true){synchronized(musicLock){
             if(!ended.get())latestMusic.get()?.let{musicAir.get()?.nowPlaying(it,replaceMedia=replaceMedia)}
         }}
@@ -306,28 +309,12 @@ class SessionController(
             }
         }
         navPush.set(::pushSnapshot)
-        // v90(20104) 导航标定自动化：用户无法跑 adb，原 NAV_TEST 广播标定改为会话内自动轮播。
-        // 等车机 5200 订阅生效（最长 120s；pushSnapshot 自带 inactive 丢弃闸门，双保险），
-        // 然后依次推 type 1/2/3/5/8 各 6 秒，看车机导航卡片哪个出现转向图标/图标是否变化。
-        // 只推"标定typeN"路名，不与真实导航混淆；整段包 runCatching，绝不影响会话主干。
-        scope.launch(Dispatchers.IO){
-            runCatching{
-                var waitedSec=0
-                while(!ended.get()&&!NavigationGuidance.active&&waitedSec<120){delay(1_000);waitedSec++}
-                if(ended.get())return@launch
-                if(!NavigationGuidance.active){
-                    BridgeStore.log(id,"[carvex.nav] auto-calibration skipped: 5200 never subscribed within 120s")
-                    return@launch
-                }
-                BridgeStore.log(id,"[carvex.nav] auto-calibration begin: types=1,2,3,5,8 interval=6s (watch the car nav card)")
-                for(tp in listOf(1,2,3,5,8)){
-                    if(ended.get()||!NavigationGuidance.active)break
-                    pushSnapshot(NavigationSnapshot(road="标定type"+tp,remainMeters=1200,toManeuverMeters=300,maneuverType=tp))
-                    delay(6_000)
-                }
-                BridgeStore.log(id,"[carvex.nav] auto-calibration end (active="+NavigationGuidance.active+")")
-            }.onFailure{BridgeStore.log(id,"[carvex.nav] auto-calibration failed: "+it.javaClass.simpleName)}
-        }
+        // v92(20106) 自动标定回滚记录：v90 的合成轮播（types 1/2/3/5/8 各 6s）在 6.2 实车
+        // 四段会话（53154da5/1ca28e9f/0e5dc972/3ea013bd）全部 5202 sent=true，车机导航零反应，
+        // "合成轮播可探出固件机动枚举"假设被否证；且合成"标定typeN"路名与真实 HUD 推送在
+        // 5201 上互相穿插污染。真实转向改走 carlife_show_hud_info 的 navi_turn 透传
+        // （见 HostCallbacks.optionalAction 的 HUD handler）。若真实数据仍无箭头，
+        // 下一步反汇编 accessoryd 的 5202 handler 取真实枚举与必填参数。
         // Speech output activity is not proof that recognition is listening or has ended.
         // VoiceButtonToggle keeps local accepted requests until a verified host state is available.
         val heldKeys=mutableMapOf<Int,Long>()
@@ -435,6 +422,26 @@ class SessionController(
                                 BridgeStore.log(id,"CarLife music artwork observed but no usable JPEG; nothing sent")
                                 return@launch
                             }
+                            // v92(20106) 封面稳定闸：6.2 实车日志（3ea013bd）实锤 CarWith/车机在
+                            // 媒体页轮换曲目——persistentId 每 10-15s 变一次、music_info 每 2s 到、
+                            // 封面字节在两张图之间每 5s 交替，旧逻辑每次新图都取消上一个传输，
+                            // 119 次提交/118 次取消令传输永远在半途被打断，车机一张稳定完整的
+                            // 封面都拿不到（用户实测：封面不显示）。闸规则：
+                            // a) 与上次提交字节相同 → 跳过（不取消不重传）；
+                            // b) 字节不同但距上次提交 <15s → 跳过（15s 远大于 321KB≈6s 的
+                            //    传输时长，保证在途传输总能走完；真换歌封面最多延迟 15s）。
+                            val gateNow=SystemClock.elapsedRealtime()
+                            val gateOld=artworkGate.get()
+                            if(gateOld!=null){
+                                val identical=gateOld.second.contentEquals(jpeg)
+                                if(identical||gateNow-gateOld.first<15_000){
+                                    BridgeStore.log(id,"[carvex.art] gate skip: "+
+                                        (if(identical)"identical-bytes" else "throttle "+(gateNow-gateOld.first)+"ms")+
+                                        " bytes="+jpeg.size)
+                                    return@launch
+                                }
+                            }
+                            artworkGate.set(gateNow to jpeg)
                             val air=musicAir.get()?:activeAir
                             if(air==null){
                                 BridgeStore.log(id,"CarLife artwork ready but no AirSession yet; nothing sent")
@@ -452,12 +459,20 @@ class SessionController(
                     "carlife_show_hud_info"->{
                         val road=intent.getStringExtra("road_name")?:""
                         val remain=intent.getIntExtra("remain_distance",-1)
-                        BridgeStore.update(id){it.copy(hostHud="${"kind="}${intent.getIntExtra("action",0)}${" turn="}${intent.getIntExtra("navi_turn",0)}${" remains="}${remain}${" total="}${intent.getIntExtra("total_distance",0)}${" road="}${road}")}
-                        // 只翻译语义已确认的字段：路名与剩余距离。action/navi_turn/total_distance
-                        // 仍保留为诊断串——它们的枚举在固件上未标定，猜错会让仪表显示错箭头。
+                        val turn=intent.getIntExtra("navi_turn",0)
+                        BridgeStore.update(id){it.copy(hostHud="${"kind="}${intent.getIntExtra("action",0)}${" turn="}${turn}${" remains="}${remain}${" total="}${intent.getIntExtra("total_distance",0)}${" road="}${road}")}
+                        // v92(20106) 真实转向透传：CarWith 的 carlife_show_hud_info 自带 navi_turn
+                        // （6.2 extras 实证含 navi_turn/turn_icon_data），是手机导航的真实转向值。
+                        // v90 自动标定的合成 5 types 全部 sent=true 但车机零反应——合成路线+机动
+                        // 上下文疑似被车机整体丢弃。改推真实 HUD 一套齐：真实路名+真实剩余距离+
+                        // 原始 navi_turn。转向枚举仍未标定（可能错箭头，实车观察反馈即可）；
+                        // turn=0 表示无转向信息，保持不推机动。
                         pushSnapshot(NavigationSnapshot(
                             road=road.takeIf{it.isNotEmpty()},
-                            remainMeters=remain.takeIf{it>=0}))
+                            remainMeters=remain.takeIf{it>=0},
+                            toManeuverMeters=remain.takeIf{it>=0},
+                            maneuverType=turn.takeIf{it!=0}))
+                        BridgeStore.log(id,"[carvex.nav] hud road=$road remain=$remain turn=$turn")
                     }
                     "carlife_change_theme"->{
                         val mode=intent.getIntExtra("mode",-1)
