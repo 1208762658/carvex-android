@@ -83,9 +83,24 @@ internal object CarLifeArtwork {
         return Bitmap.createScaledBitmap(bitmap, width, height, true)
     }
 
-    /** 依次尝试所有已知字段；第一个能取到字节的就用，取不到就试下一个。 */
+    /** 依次尝试所有已知字段；第一个能取到字节的就用，取不到就试下一个。
+     *  v90(20104)：URL 字段（coverUrl 等）优先——5.8/5.9 实车链里 cover Bitmap 恒为
+     *  250x250，只有放大损失；URL 通常是专辑原图，且首歌阶段 URL 往往比渲染好的
+     *  Bitmap 更早可用（"第一首无封面"的一个候选成因）。字节字段保留为兜底：
+     *  URL 拉取失败（无网/超时 3s/超限）自动落回 Bitmap，不碰控制会话。 */
     private fun readSource(context: Context, intent: Intent, log: (String) -> Unit): ByteArray? {
         val extras = intent.extras ?: return null
+        for (key in ARTWORK_URL_KEYS) {
+            val url = extras.getString(key)?.takeIf { it.isNotBlank() } ?: continue
+            val bytes = runCatching { bytesOfUrl(url) }.getOrElse { error ->
+                log("artwork url " + key + " unreadable: " + error.javaClass.simpleName)
+                null
+            }
+            if (bytes != null && bytes.isNotEmpty()) {
+                log("artwork source field=" + key + " type=url bytes=" + bytes.size)
+                return bytes
+            }
+        }
         for (key in ARTWORK_KEYS) {
             if (!extras.containsKey(key)) continue
             val value = extras.get(key)
@@ -96,16 +111,6 @@ internal object CarLifeArtwork {
             if (bytes != null && bytes.isNotEmpty()) {
                 log("artwork source field=" + key + " type=" + (value?.javaClass?.simpleName ?: "null") +
                     " bytes=" + bytes.size)
-                return bytes
-            }
-        }
-        for (key in ARTWORK_URL_KEYS) {
-            val url = extras.getString(key)?.takeIf { it.isNotBlank() } ?: continue
-            val bytes = runCatching { bytesOfUrl(url) }.getOrElse { error ->
-                log("artwork url unreadable: " + error.javaClass.simpleName); null
-            }
-            if (bytes != null && bytes.isNotEmpty()) {
-                log("artwork source field=" + key + " bytes=" + bytes.size)
                 return bytes
             }
         }

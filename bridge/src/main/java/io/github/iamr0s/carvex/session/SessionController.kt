@@ -41,11 +41,12 @@ private const val FAIL_STREAK_LIMIT=5
 /** RECORD 刚过就被切断（对端崩溃重启）时，至少等这么久再碰它。 */
 private const val PEER_CRASH_COOLDOWN_SEC=20
 
-/** 按像素率估算码率：约 0.13 bit/像素/帧，最低 1 Mbps。
- *  例：1080p30≈8.1 Mbps、720p30≈3.6 Mbps、1080p60≈16.2 Mbps。 */
+/** 按像素率估算码率：v90(20104) 乘数 13/100 → 186/1000，把 866F 实测几何 1354x666@60 的默认值
+ *  从 7.03 Mbps 提到 ≈10.0 Mbps（画质上限实验，用户无法跑 adb，故直接改默认）。
+ *  最低 1 Mbps。例：1080p30≈11.6 Mbps、720p30≈5.1 Mbps、1080p60≈23.2 Mbps。 */
 private fun nominalBitrate(width:Int,height:Int,fps:Int):Int {
     val pixelFramesPerSecond=width.toLong()*height*fps
-    return (pixelFramesPerSecond*13/100).toInt().coerceAtLeast(MIN_BITRATE)
+    return (pixelFramesPerSecond*186/1000).toInt().coerceAtLeast(MIN_BITRATE)
 }
 
 class SessionController(
@@ -305,6 +306,28 @@ class SessionController(
             }
         }
         navPush.set(::pushSnapshot)
+        // v90(20104) 导航标定自动化：用户无法跑 adb，原 NAV_TEST 广播标定改为会话内自动轮播。
+        // 等车机 5200 订阅生效（最长 120s；pushSnapshot 自带 inactive 丢弃闸门，双保险），
+        // 然后依次推 type 1/2/3/5/8 各 6 秒，看车机导航卡片哪个出现转向图标/图标是否变化。
+        // 只推"标定typeN"路名，不与真实导航混淆；整段包 runCatching，绝不影响会话主干。
+        scope.launch(Dispatchers.IO){
+            runCatching{
+                var waitedSec=0
+                while(!ended.get()&&!NavigationGuidance.active&&waitedSec<120){delay(1_000);waitedSec++}
+                if(ended.get())return@launch
+                if(!NavigationGuidance.active){
+                    BridgeStore.log(id,"[carvex.nav] auto-calibration skipped: 5200 never subscribed within 120s")
+                    return@launch
+                }
+                BridgeStore.log(id,"[carvex.nav] auto-calibration begin: types=1,2,3,5,8 interval=6s (watch the car nav card)")
+                for(tp in listOf(1,2,3,5,8)){
+                    if(ended.get()||!NavigationGuidance.active)break
+                    pushSnapshot(NavigationSnapshot(road="标定type"+tp,remainMeters=1200,toManeuverMeters=300,maneuverType=tp))
+                    delay(6_000)
+                }
+                BridgeStore.log(id,"[carvex.nav] auto-calibration end (active="+NavigationGuidance.active+")")
+            }.onFailure{BridgeStore.log(id,"[carvex.nav] auto-calibration failed: "+it.javaClass.simpleName)}
+        }
         // Speech output activity is not proof that recognition is listening or has ended.
         // VoiceButtonToggle keeps local accepted requests until a verified host state is available.
         val heldKeys=mutableMapOf<Int,Long>()
@@ -942,8 +965,15 @@ class SessionController(
                 // 显式指定目标码率，绕过 nominal/host-hint 候选计算（画质上限测试用）。
                 // 走 SystemProperties 反射读（adb setprop 可达），与 BluetoothReadyGate 同一惯例；
                 // 读失败按 0=不干预处理，不影响默认行为。编码器能力上限与既有 maxBitrate 压制仍然生效。
+                // v89 引入的覆盖旋钮；v90(20104) 增补 Settings.Global 通道并置为首选——
+                // 5.9 实测证明部分机型 adb setprop 对非标准属性名会被 SELinux 静默拒绝，
+                // 而 `adb shell settings put global carvex_video_target_bitrate <bps>` 可靠可达，
+                // 应用侧 Settings.Global.getString 无需任何权限。两个通道任一非 0 即生效。
                 val targetOverride=runCatching{
-                    Class.forName("android.os.SystemProperties")
+                    val viaSettings=android.provider.Settings.Global.getString(
+                        context.contentResolver,"carvex_video_target_bitrate")
+                    if(!viaSettings.isNullOrBlank())viaSettings
+                    else Class.forName("android.os.SystemProperties")
                         .getMethod("get",String::class.java,String::class.java)
                         .invoke(null,"carvex.video.targetBitrate","0") as String
                 }.getOrDefault("0").trim().toIntOrNull() ?: 0
