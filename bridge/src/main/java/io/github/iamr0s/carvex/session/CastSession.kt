@@ -31,4 +31,19 @@ interface CastSession {
 
     /** 切换 CarPlay 音频测试（界面诊断用）。 */
     fun toggleCarPlayAudioTest()
+
+    /**
+     * 把一条导航快照推给车机（iAP2 `5201/5202`），供仪表/车机导航卡片显示。
+     *
+     * 只在车机已发 `5200` 订阅后生效；未标定的枚举（机动类型/状态/单位）传 null 即不下发，
+     * 失败只记日志、不抛异常。
+     */
+    fun pushNavigation(
+        road: String?,
+        remainMeters: Int?,
+        toManeuverMeters: Int? = null,
+        maneuverType: Int? = null,
+        state: Int? = null,
+        distanceUnits: Int? = null,
+    )
 }

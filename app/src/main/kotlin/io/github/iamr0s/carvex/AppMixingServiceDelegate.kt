@@ -5,8 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import io.github.iamr0s.carvex.host.mixing.service.MixingBrand
 import io.github.iamr0s.carvex.host.mixing.service.MixingServiceDelegate
 import io.github.iamr0s.carvex.host.mixing.service.MixingServiceSession
@@ -71,6 +75,37 @@ internal class AppMixingServiceDelegate(private val service: Service) : MixingSe
         override fun sendHostKey(code: Int) = controller.triggerCarWithKey(code)
         override fun startHostAudioProbe() = controller.startCarWithAudioProbe()
         override fun toggleProtocolAudioTest() = controller.toggleCarPlayAudioTest()
+    }
+
+    /**
+     * 导航标定入口（临时调试面，标定完成后可整段删除）：
+     * 让 adb 在不依赖 CarWith/高德的情况下直接驱动 5201/5202，把固件的转向类型扫出来。
+     *
+     * adb shell am broadcast -a io.github.iamr0s.carvex.NAV_TEST \
+     *   --es road 测试路 --ei remain 1200 --ei to_maneuver 300 --ei type 3
+     */
+    private val navTestReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            fun optionalInt(name: String): Int? =
+                if (intent.hasExtra(name)) intent.getIntExtra(name, -1) else null
+            controller.pushNavigation(
+                road = intent.getStringExtra("road"),
+                remainMeters = optionalInt("remain"),
+                toManeuverMeters = optionalInt("to_maneuver"),
+                maneuverType = optionalInt("type"),
+                state = optionalInt("state"),
+                distanceUnits = optionalInt("units"),
+            )
+        }
+    }
+
+    init {
+        ContextCompat.registerReceiver(
+            service,
+            navTestReceiver,
+            IntentFilter("io.github.iamr0s.carvex.NAV_TEST"),
+            ContextCompat.RECEIVER_EXPORTED,
+        )
     }
 
     init {

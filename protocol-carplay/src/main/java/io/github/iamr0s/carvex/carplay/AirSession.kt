@@ -267,15 +267,41 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     log("VW-866F capability confirm 0x4170 -> responded 0x4171 echoed="+(echo?.size?.toString()?:"null")+" sent="+ok)
                 }
                 0xae00->{val ok=runtime.send(0xae01,emptyList());log("VW-866F consent probe 0xae00 -> responded 0xae01 empty success sent="+ok)}
-                // v14.5 (2026-11-03): 0x5200 is the last message in the 866F CONTROL_READY
-                // probe batch (4154/4157/4170/ae00/5200/5000) that we had never answered
-                // across v8..v14.4 (no 0x5201 response in any on-car log). 866F advertises
-                // 0x4156/0x4159/0x415B/0x415C/0x415D/0x415E/0x415F/0x4160/0x4172/0x5002/
-                // 0x5203/0xAE02/0xFFFB in accessorySends but stopped pushing after 5200 on
-                // every version - consistent with a gate: it waits for the 5201 reply
-                // before sending the next batch. Empty reply mirrors the accepted
-                // 4155/4158 empty-success pattern.
-                0x5200->{val ok=runtime.send(0x5201,emptyList());log("VW-866F carplay-gate 0x5200 -> responded 0x5201 empty success sent="+ok+" (gate: 866F pushes next accessorySends batch only after 5201)")}
+                // v47 (2026-11-14): 866F 发 5200 是**真订阅**，不是"等 5201 才继续推下批"的闸门。
+                // 2026-11-10 实车日志（logs/carvex-2015.1.log:771）拿到 componentList=[1]：866F
+                // 在识别里把 5201/5202 声明进自己的 receiverCanReceive，却只发 5200 等回声。
+                // 空 5201 保留（v14.5 起的既有成功样本，不碰握手），但必须同时把订阅状态置位——
+                // 否则 deliverNavigation / navigationRouteUpdate 的 active 闸门永远为 false，
+                // 仪表导航（箭头/路名/剩余距离）一条真数据都发不出去。
+                // 门控沿用固件必需消息表：只有 5200/5203 出站、5201/5202 入站都声明了才接受。
+                0x5200->{
+                    val ok=runtime.send(0x5201,emptyList())
+                    val sends=runtimeCapabilities.sentByAccessory.map{it.value}.toSet()
+                    val receives=runtimeCapabilities.receivedByAccessory.map{it.value}.toSet()
+                    val fields=command.fields
+                    val parsed=when{
+                        !NavigationGuidance.featureReady(sends,receives)->{
+                            log("VW-866F navigation start ignored: feature 17 required message group incomplete")
+                            null
+                        }
+                        fields==null->{
+                            log("VW-866F navigation start ignored: no fields")
+                            null
+                        }
+                        else->NavigationGuidance.start(fields)
+                    }
+                    log("VW-866F carplay-gate 0x5200 -> responded 0x5201 empty success sent="+ok+
+                        " navigation active="+NavigationGuidance.active+" components="+NavigationGuidance.components+
+                        " mask="+NavigationGuidance.mask+(if(parsed==null)" (start rejected)" else " (start accepted)"))
+                }
+                // 866F 结束导航会发 5203（它把 5203 声明在 accessorySends）：只清订阅状态，
+                // 不回包（固件侧 StopRouteGuidance 本身无应答语义）。
+                0x5203->{
+                    val fields=command.fields
+                    val stopped=if(fields==null)false else NavigationGuidance.stop(fields)
+                    log("VW-866F navigation stop 0x5203 -> active="+NavigationGuidance.active+
+                        " components="+NavigationGuidance.components+" accepted="+stopped)
+                }
             }
         }
     },negotiate={link->
