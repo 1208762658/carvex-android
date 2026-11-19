@@ -938,6 +938,20 @@ class SessionController(
                 val nominal=nominalBitrate(hostWidth,hostHeight,fps)
                 val candidates=listOfNotNull(normalizedHint,nominal)
                 var bitrate=candidates.max()
+                // v89（码流 10M 实验）：adb shell setprop carvex.video.targetBitrate <bps>
+                // 显式指定目标码率，绕过 nominal/host-hint 候选计算（画质上限测试用）。
+                // 走 SystemProperties 反射读（adb setprop 可达），与 BluetoothReadyGate 同一惯例；
+                // 读失败按 0=不干预处理，不影响默认行为。编码器能力上限与既有 maxBitrate 压制仍然生效。
+                val targetOverride=runCatching{
+                    Class.forName("android.os.SystemProperties")
+                        .getMethod("get",String::class.java,String::class.java)
+                        .invoke(null,"carvex.video.targetBitrate","0") as String
+                }.getOrDefault("0").trim().toIntOrNull() ?: 0
+                if(targetOverride>0){
+                    BridgeStore.log(id,"Video bitrate override carvex.video.targetBitrate="+targetOverride+
+                        " (computed candidates max="+bitrate+", codecCeiling="+videoCeiling+")")
+                    bitrate=targetOverride
+                }
                 bitrate=videoCeiling?.let{bitrate.coerceAtMost(it)} ?: bitrate
                 // 同理默认不设上限（0 = 不干预）；需要压时用 carvex.video.maxBitrate 显式指定。
                 val bitrateCap=System.getProperty("carvex.video.maxBitrate")?.trim()?.toIntOrNull() ?: 0
