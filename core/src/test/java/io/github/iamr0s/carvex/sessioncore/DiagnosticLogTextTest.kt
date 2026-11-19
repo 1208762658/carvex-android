@@ -8,12 +8,12 @@ import java.time.Instant
 class DiagnosticLogTextTest {
     private fun line(index: Int) = "${Instant.EPOCH.plusMillis(index.toLong())} [session] line=$index"
 
-    @Test fun retentionKeepsStartupAndNewestTwoThousandRatherThanUiFourHundred() {
-        val all = (0 until 2500).map(::line)
+    @Test fun retentionKeepsStartupAndNewestWindowRatherThanUiFourHundred() {
+        val all = (0 until DiagnosticLogText.MEMORY_LINES + 500).map(::line)
         val retained = DiagnosticLogText.retain(all)
-        assertEquals(2000, retained.size)
+        assertEquals(DiagnosticLogText.MEMORY_LINES, retained.size)
         assertEquals(all.take(24), retained.take(24))
-        assertEquals(all.takeLast(1976), retained.drop(24))
+        assertEquals(all.takeLast(DiagnosticLogText.MEMORY_LINES - 24), retained.drop(24))
     }
 
     @Test fun smallLogIsNotTruncated() {
@@ -56,7 +56,8 @@ class DiagnosticLogTextTest {
     @Test fun oversizedDiskReadIsBoundedAndDiscardsPartialLeadingLine() {
         val file = Files.createTempFile("carvex-log-test", ".txt").toFile()
         try {
-            val lines = (0 until 4000).map { line(it) + " 导航".repeat(100) }
+            // 行宽约 740B，6000 行 ≈ 4.4MB，跨过 4MB 轮转上限才会触发截断断言。
+            val lines = (0 until 6000).map { line(it) + " 导航".repeat(100) }
             file.writeText(lines.joinToString("\n", postfix = "\n"))
             val exported = DiagnosticLogText.readDisk(file)
             assertTrue(exported.size < lines.size)
@@ -69,10 +70,10 @@ class DiagnosticLogTextTest {
         BridgeStore.clearLogs()
         val session = BridgeStore.begin(1)
         try {
-            repeat(2100) { BridgeStore.log(session, "retention-regression-$it") }
-            assertEquals(2000, BridgeStore.logs.value.size)
+            repeat(DiagnosticLogText.MEMORY_LINES + 100) { BridgeStore.log(session, "retention-regression-$it") }
+            assertEquals(DiagnosticLogText.MEMORY_LINES, BridgeStore.logs.value.size)
             assertTrue(BridgeStore.logs.value.first().endsWith("retention-regression-0"))
-            assertTrue(BridgeStore.logs.value.last().endsWith("retention-regression-2099"))
+            assertTrue(BridgeStore.logs.value.last().endsWith("retention-regression-${DiagnosticLogText.MEMORY_LINES + 99}"))
             val exported = BridgeStore.export()
             assertTrue(exported.contains("[$session] retention-regression-0"))
             assertTrue(exported.contains("[$session] retention-regression-2099"))

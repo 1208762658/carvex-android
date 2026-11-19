@@ -107,6 +107,37 @@ data class Options(val appearance:Appearance=Appearance.SYSTEM,val color:Int=DEF
         }
     }
 }
+/**
+ * 日志降噪收口点（与 protocol-carplay 的 LogGate 同一约定：`carvex.log.quiet=0` 恢复全量）。
+ *
+ * 5.6 实测：8 分钟 CarPlay 会话产生 3439 行，其中约 72% 是下表这些"每秒/每包"级
+ * 心跳行。它们把 diagnostic.log 的轮转窗口塞满，会话引导段（`[carvex.866f] optional
+ * order`、start gate、失败现场）整段被挤出文件——导出日志后无法判定实验是否生效，
+ * 也抓不到"连接有一定失败率"的现场。
+ *
+ * 只在写日志的收口点丢行，不动任何业务行为；需要逐帧对齐协议时 quiet=0。
+ * 刻意不降噪：artwork announce/complete、Audio packet/sender/host 周期摘要、
+ * Compressed RTP、host-action music_info（换歌）、Resource close、BELE——这些是
+ * 音频证据链与失败定位的证据行。
+ */
+internal object DiagnosticNoise {
+    private val quiet: Boolean = System.getProperty("carvex.log.quiet")?.trim() != "0"
+    private val perTick = arrayOf(
+        "hb video=",                                   // AirSession 心跳，每秒 1 行
+        "artwork chunk progress ",                     // 封面分块进度，每块 1 行
+        "host host-action:carlife_vehicle_music_progress", // 进度上报，每秒 1 行
+        "Host action carlife_vehicle_music_progress",  // 上行的成对明细行
+        "iAP frame TX ",                               // 帧级 TX（安静模式下由消息级行承载）
+        "iAP frame RX ",                               // 帧级 RX
+        "iAP TX ",                                     // 与 frame TX 成对的人类可读重复行
+        "Control read readerPhase=",                   // 控制通道读取心跳，约 5 秒 1 行
+    )
+    fun drop(message: String): Boolean {
+        if (!quiet) return false
+        for (p in perTick) if (message.startsWith(p)) return true
+        return false
+    }
+}
 object BridgeStore {
     private val mutable=MutableStateFlow(SessionState())
     val state=mutable.asStateFlow()
@@ -159,12 +190,12 @@ object BridgeStore {
                 synchronized(logFileLock){
                     if(entry.line==null){f.writeText("");diskLogGeneration=entry.generation}
                     else if(entry.generation==logGeneration){
-                        if(f.length()>1024*1024){
+                        if(f.length()>4*1024*1024){
                             val tail=buildList {
                                 var bytes=0
                                 logState.value.asReversed().forEach { line ->
                                     val size=line.toByteArray(Charsets.UTF_8).size+1
-                                    if(bytes<512*1024 || isEmpty()){add(line);bytes+=size}
+                                    if(bytes<2*1024*1024 || isEmpty()){add(line);bytes+=size}
                                 }
                             }.asReversed()
                             f.writeText(tail.joinToString("\n")+"\n")
@@ -222,6 +253,7 @@ object BridgeStore {
     fun redact(s:String):String = s.replace(Regex("(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}"),"**:**:**:**:**:**")
         .replace(Regex("(?i)(password|psk|seed|secret|ssid|pairingPin|setupCode)\\s*[:=]\\s*[^,\\s]+"),"$1=<redacted>").take(500)
     @Synchronized fun log(id:String,message:String){
+        if(DiagnosticNoise.drop(message))return
         val line=Instant.now().toString()+" ["+id+"] "+redact(message)
         if(id==mutable.value.id){
             if(sessionStartup.size<220)sessionStartup.add(line)

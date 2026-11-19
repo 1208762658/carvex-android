@@ -6,10 +6,13 @@ import java.time.Instant
 
 /** Export raw diagnostics, independently of the UI's shorter, formatted preview. */
 internal object DiagnosticLogText {
-    const val MEMORY_LINES = 2000
+    // 5.6 之前的 2000 行在会话稳态期 10 分钟就被填满；放宽到 4000 行，
+    // 保证"当天第一次启动"的头部引导（start gate / bonjour / 发布状态）始终可见。
+    const val MEMORY_LINES = 4000
     const val STARTUP_LINES = 24
-    // The writer rotates at 1 MiB; allow the final log record that crossed that limit.
-    const val DISK_BYTES = 1024 * 1024 + 4096
+    // 磁盘轮转上限 1 MiB → 4 MiB：1 MiB 只够 8 分钟 CarPlay 会话的稳态心跳，
+    // 引导段（4e0e 自证行、gate、失败现场）整段被挤出诊断文件，导出后无法判定。
+    const val DISK_BYTES = 4 * 1024 * 1024 + 4096
 
     fun retain(lines: List<String>): List<String> =
         if (lines.size <= MEMORY_LINES) lines
