@@ -100,13 +100,6 @@ fun classifyCarPlayPath(config:WifiBootstrap?,usbTransportReady:Boolean=false):C
 
 class IapStartupTimeout(message:String,val canFallback:Boolean):SocketTimeoutException(message)
 
-/**
- * 本机到目标车的 ACL 连接态（反射 isConnected，系统签名可用）。
- * 返回 null 表示读不到（隐藏 API 被挡）——重连闸门对 null 一律放行，绝不因读不到而拦截。
- */
-internal fun aclToTargetConnected(device:android.bluetooth.BluetoothDevice):Boolean? =
-    runCatching{device.javaClass.getMethod("isConnected").invoke(device) as Boolean}.getOrNull()
-
 object Bootstrap {
     internal fun declarationPairComplete(request:Int,response:Int,accessoryReceives:Set<Int>,accessorySends:Set<Int>)=
         request in accessoryReceives&&response in accessorySends
@@ -373,17 +366,11 @@ object Bootstrap {
                         // 期间蓝牙栈自己 off/on 重启了两轮（00:15:24 off → 00:15:26 on → 00:16:03 off → 00:16:09 on），
                         // 成功那次握手 5.79s。所以出站前先等"栈就绪"；超时也放行，只记录不阻断。
                         BluetoothReadyGate.awaitReady(adapter,device,BluetoothReadyGate.READY_TIMEOUT_MS){log(it)}
-                        // v90(20104) 重连竞态闸门：5.8 b8364bfe / 5.9 7919f242 三次复现同一签名——
-                        // 蓝牙重开后 attempt 抢跑，车机侧 BT 尚未回连（ACL idle），出站 RFCOMM
-                        // phone/phone-v2/raw 全部被拒，白烧 20-30s，此刻用户点磁贴必然显示失败。
-                        // RFCOMM 出站的前提是本机到目标车存在 ACL；ACL 明确 idle 时探测物理上
-                        // 不可能成功，直接结束本次 attempt，把重连窗口留给 ACL 回连触发的下一次。
-                        // isConnected 读不到（null，隐藏 API 被挡）时绝不拦截，行为与 v89 完全一致。
-                        if(aclToTargetConnected(device)==false){
-                            log("[carvex.866f] reconnect gate: ACL idle to target before outbound probes; skip probes (race guard, car BT not connected)")
-                            failed("outbound",java.io.IOException("reconnect-gate: ACL idle before probes"))
-                            return@launch
-                        }
+                        // v91(20105)：v90 的"ACL idle 跳过出站探测"闸门已回滚。6.0 日志 5deba80c
+                        // （2026-11-19 19:36）证明其物理前提不成立：start gate 读到 acl-idle 后 1.3s，
+                        // 出站 page 照样 peer matched（page 本身会把 ACL 拉起来）——"ACL idle"不代表
+                        // 车机不可达，闸门会把这种成功探测拦掉。失败烧 20-30s 是浪费但无害，
+                        // 真正的重连竞态修复另找判据（见 #47：熄火后 AirPlay 握手中段静默终止样本）。
                         var last:Exception?=null
                         var attemptIndex=0
                         // 预热并发跑，绝不挡住探测：0.7 里每次探测都被拖到 5 秒超时，
@@ -438,13 +425,6 @@ object Bootstrap {
                         // 车机只在用户点过 CarPlay 之后才开放蓝牙连接窗口，在此之前的探测必然
                         // 35–162ms 失败或 page 超时。因此失败后不立刻放弃，而是在窗口期内低频
                         // 反复拨号：用户点车机的那一刻，下一轮探测就能抓住。
-                        // v90(20104)：UUID 探测全败后复查 ACL——若车机 BT 已掉线，raw 窗口
-                        // 同样必然徒劳（5.9：一轮并发拨号 18s 才超时），直接结束本次 attempt。
-                        if(aclToTargetConnected(device)==false){
-                            log("[carvex.866f] reconnect gate: ACL idle after UUID probes; skip raw window (race guard)")
-                            failed("outbound",last?:java.io.IOException("reconnect-gate: ACL idle after UUID probes"))
-                            return@launch
-                        }
                         if(!stopping.get()&&!winner.isCompleted){
                             // v51：866F 只在司机点过 CarPlay 之后才开放蓝牙连接窗口，而 cw 给我们的
                             // 这一次 attempt 只能活几十秒。串行 1..6 每通道 5s，一轮就要 35s，窗口
