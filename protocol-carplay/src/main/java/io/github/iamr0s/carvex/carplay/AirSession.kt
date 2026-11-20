@@ -1346,9 +1346,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 log("[carvex.np] pull start ack got=$gotStart ms="+((System.nanoTime()-t0)/1_000_000))
                 if(gotStart){
                     var offset=0;var sent=0
+                    val total=(jpeg.size+perPacket-1)/perPacket
                     while(offset<jpeg.size&&failure==null){
                         val end=minOf(jpeg.size,offset+perPacket)
-                        failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.chunk(carId,jpeg.copyOfRange(offset,end)))
+                        // v99：末块带 0x40 触发车机 Success（缓存填充的唯一完成信号），
+                        // 首块带 0x80 对齐车机自家发送约定。
+                        failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.chunk(carId,
+                            jpeg.copyOfRange(offset,end),first=sent==0,last=sent+1==total))
                         if(failure==null){
                             offset=end;sent++
                             if(sent%4==0)Thread.sleep(20)
@@ -1565,9 +1569,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             log("artwork start ack got=$gotStart ms="+((System.nanoTime()-started)/1_000_000))
             var offset=0
             var sent=0
+            val total=(jpeg.size+perPacket-1)/perPacket
             while(offset<jpeg.size){
                 val end=minOf(jpeg.size,offset+perPacket)
-                val packet=ArtworkFileTransfer.chunk(transferId,jpeg.copyOfRange(offset,end))
+                // v99：分块 type 3→2 + 末块 0x40（车机 Success 触发位）+ 首块 0x80。
+                val packet=ArtworkFileTransfer.chunk(transferId,jpeg.copyOfRange(offset,end),
+                    first=sent==0,last=sent+1==total)
                 failure=sendArtworkPacket(sessionId,packet)
                 if(failure!=null){
                     log("artwork transfer abandoned at chunk="+sent+" offset="+offset+"/"+jpeg.size+

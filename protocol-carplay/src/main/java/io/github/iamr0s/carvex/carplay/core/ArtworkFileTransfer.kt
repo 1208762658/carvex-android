@@ -25,15 +25,22 @@ package io.github.iamr0s.carvex.carplay.core
  *
  * 三类操作（本实现只用到这三个）：
  *   - `4` 建立：按上表的完整字段布局；
- *   - `3` 数据：正文是本次分块；分块大小由调用方按会话 MTU 切，不能再套 CSM；
- *   - `5` 结束：没有正文。
+ *   - `2` 数据：正文是本次分块（v99 修正，原 3 是车机发送方向的操作码）；
+ *     末块 type|0x40 触发车机侧 Success，首块可选 type|0x80；
+ *   - `5` 结束：没有正文。对 accessory→车机方向车机直接忽略（id<128 静默退出），
+ *     保留发送只为兼容旧日志对齐。
  *
  * 这里只负责"怎么封"，不负责"发给谁、什么时候发"——投递在 `AirSession.artwork()`，
  * 会话号来自 [IapLink.sessionOfKind]`(1)`，缺会话时上层整段 no-op。
  */
 object ArtworkFileTransfer {
     const val TYPE_START=4
-    const val TYPE_CHUNK=3
+    // v99(20121)：分块 type 3→2。固件 `_iAP2FileTransferHandleRecv`（0x10006de9c）里
+    // type 2 才是 accessory→车机的数据分支（state {2,3,8,9} 接收，0x10006e4a4 分派）；
+    // type 3 是车机自己的数据发送/应答方向——我们 state=8 时收到 type 3 只会切 state 8→9
+    // 并丢载荷（0x10006e328），后续 type 3 直接落"unexpected state"日志分支。v98 及之前
+    // 63/64 个分块全部被丢，文件从未在车机侧拼装，artwork 缓存恒空 → 框架绿方块。
+    const val TYPE_CHUNK=2
     const val TYPE_COMPLETE=5
     // iOS 侧 `_iAP2FileTransferDelete` 对应线上的 type 6。iPhone 在新封面到来时
     // 会先把上一张的传输 cancel 掉（日志串 `#Artwork %d: cancel previous transfer`），
@@ -73,9 +80,20 @@ object ArtworkFileTransfer {
         return head.toByteArray()
     }
 
-    fun chunk(transferId:Byte,body:ByteArray):ByteArray {
+    /** v99：byte1 高位标志。末块 bit6(0x40)=触发 `_iAP2FileTransferSuccess`（0x10006ef6c：
+     *  tbnz w24,#6 → state 0xb → 注册回调收到拼装完成的文件 → artwork 缓存填充）——
+     *  这是 accessory→车机方向唯一的"完成"信号；独立 type5 结束包对 id<128 的传输
+     *  在 0x10006e158 处静默退出（它是车机→手机方向的握手）。首块 bit7(0x80) 是车机
+     *  自家发送路径的"首块"约定（SendBufferPacket 0x10006c1c4: orr w8, w22, #0x80），
+     *  接收侧不校验，按协议对齐补上。 */
+    const val CHUNK_FLAG_FIRST=0x80
+    const val CHUNK_FLAG_LAST=0x40
+    fun chunk(transferId:Byte,body:ByteArray,first:Boolean=false,last:Boolean=false):ByteArray {
         require(body.isNotEmpty()){"empty file-transfer chunk"}
-        return byteArrayOf(transferId,TYPE_CHUNK.toByte())+body
+        var type=TYPE_CHUNK
+        if(first)type=type or CHUNK_FLAG_FIRST
+        if(last)type=type or CHUNK_FLAG_LAST
+        return byteArrayOf(transferId,type.toByte())+body
     }
 
     fun complete(transferId:Byte):ByteArray =
