@@ -1308,11 +1308,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      * 而 group0 形状能拿回 `01`+`02`——顶层那条会把它弄没，已删。
      */
     private fun announceArtwork(transferId:Byte,stage:String):Boolean {
-        // 规范里 MediaItemArtworkFileTransferIdentifier 是 uint8，但 866F 一直不出图。
-        // 若它内部按 uint16 取值，收到 1 字节参数会读成 0（或长度不匹配直接忽略），
-        // 表现就是"接收成功、永远空白"。v76 起偶数张改发 2 字节，奇数张维持 1 字节对照。
-        val wide=(transferId.toInt() and 1)==0
-        val param=if(wide)IapWire.be16(transferId.toInt() and 0xff) else byteArrayOf(transferId)
+        // v95(20109) 报号宽度恒定 u8（规范形态 MediaItemArtworkFileTransferIdentifier=uint8）：
+        // v76 的奇偶对照实验（偶数张 u16）从未关闭。6.4 实车（20108，槽位纪律已生效）证明
+        // u16 报号的传输 start ack 必超时（id=2/4 全败），u8 报号全绿（id=1/3/5 全过）——
+        // 车机按 u8 匹配报号 id 与建立包，u16 的 "0002" 匹配不上，fileTransfer 对象建不起来。
+        // 与 v94 的 cancel 纪律合并后，传输序列不再有任何交替变量。
+        val param=byteArrayOf(transferId)
         val child=IapWire.fields(listOf(0x1a to param))
         // 3.6 抓到过 sent=false：取件码根本没送出去，车机自然无从取件。
         // 发送失败必须重试，否则"以为报了其实没报"。
@@ -1323,8 +1324,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             log("artwork announce $stage retry attempt=$attempt failed")
             try{Thread.sleep(100)}catch(e:InterruptedException){Thread.currentThread().interrupt();break}
         }
-        log("artwork announce $stage 5001 group0/0x1a id=$transferId width="+(if(wide)"u16" else "u8")+
-            " param="+param.joinToString(""){String.format("%02x",it)}+" sent=$sent")
+        log("artwork announce $stage 5001 group0/0x1a id="+(transferId.toInt() and 0xff)+
+            " width=u8 param="+param.joinToString(""){String.format("%02x",it)}+" sent=$sent")
         return sent
     }
 
