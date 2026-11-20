@@ -1251,7 +1251,13 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     }
     /** 交替实验：偶数 ID 不立即发结束包，等下一张封面到来时才补发，
      *  让传输对象保持"接收中"状态，车机想过多久来读都能读到。 */
-    @Volatile private var deferredComplete:Pair<Int,Byte>?=null
+    // v94(20108)：deferredComplete（奇偶挂"待补发 complete"实验）已删除，见 artwork() 注释。
+    /** v94(20108)：上一张传输是否已 inline complete 并收到车机 complete ACK。
+     *  6.2 实证（119 次传输 60/59 严格交替）：cancel 一个"已完成"的传输会把车机
+     *  封面槽打进死状态，下一张 start 必 1200ms 超时；真 iPhone（固件日志串
+     *  `cancel previous transfer: id=%d(%d) type=%d(%d) state=%d` 带 state 反推）
+     *  只 cancel 未完成传输、从不 cancel 已完成传输。 */
+    @Volatile private var lastArtworkCompleted=false
     private fun nextArtworkTransferId():Byte {
         // 0 留给"没有传输"，其余循环使用；同一时刻只跑一条传输。
         val next=artworkTransferId.updateAndGet{value->if(value>=255)1 else value+1}
@@ -1377,23 +1383,22 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             " bytes="+jpeg.size+" mtu=$mtu")
         artworkSender.execute{
             runtime.resetSessionDataFailure()
-            // iOS 在**新封面到来**时先把上一张的传输 cancel（日志串
-            // `#Artwork %d: cancel previous transfer: id=%d(%d) type=%d(%d) state=%d`），
-            // 也就是车机这一端只保留一个有效封面槽。我们一直只 start 不 cancel，
-            // 5.0/5.1 里那十几张封面都是"只建不收"地堆在会话 2 上（全部 state=9 挂着）。
-            // 若车机按单槽实现，堆叠的旧记录会让它认定的"当前封面"一直指向最早的空白项。
-            lastArtworkTransferId?.let{prev->
+            // v94(20108) cancel 纪律（6.2 日志 119 次传输实证）：
+            // - 上一张已完成（inline complete + ACK）→ 绝不 cancel。cancel 已完成传输
+            //   会把车机槽位打进死状态，下一张 start 1200ms 超时（id2/4/6/8 全部如此）。
+            // - 上一张 start 失败/发送失败 → 照 iOS 语义 cancel（slot 还挂在未完成态）。
+            // complete 一律 inline 且不再奇偶挂"待补发"（v5x 遗留实验：偶数张重复
+            // complete 恰好把槽位捋顺才造成 60/59 交替——删掉后序列恒定，不再靠运气）。
+            if(lastArtworkTransferId!=null&&!lastArtworkCompleted){
+                val prev=lastArtworkTransferId!!
                 lastArtworkTransferId=null
                 val r=sendArtworkPacket(sessionId,ArtworkFileTransfer.cancel(prev))
-                log("artwork cancel previous id=$prev failure="+r)
+                log("artwork cancel unfinished id=$prev failure="+r)
+            }else if(lastArtworkTransferId!=null){
+                log("artwork previous completed id=$lastArtworkTransferId; no cancel (slot auto-replace)")
             }
             lastArtworkTransferId=transferId
-            // 下一张封面到来时，先把上一张"故意挂住"的传输收尾。
-            deferredComplete?.let{(sid,id)->
-                deferredComplete=null
-                val r=sendArtworkPacket(sid,ArtworkFileTransfer.complete(id))
-                log("artwork deferred complete flushed id=$id failure="+r)
-            }
+            lastArtworkCompleted=false
             // v57 那次 0..8 全扫是在 bufferId=0 的无效状态下做的（车机连 01 都不给），结论作废。
             // 现在建立包已被正常接受，文件类型重新成为未验证变量：按封面依次换 0..8。
             // iOS artwork 路径调用 `iAP2FileTransferTypeData(record, 0)`，参数是 0。
@@ -1463,26 +1468,21 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 if(sent==1||sent==chunkCount||sent%8==0)
                     log("artwork chunk progress "+sent+"/"+chunkCount+" bytes="+offset)
             }
-            val deferThis=false
-            failure=if(deferThis)null else sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
+            // v94：complete 一律 inline；不再按奇偶挂"待补发"（那是 60/59 交替 ACK 的根源）。
+            failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(transferId))
             if(failure!=null){
                 log("artwork transfer abandoned at complete: "+failure.javaClass.simpleName+" "+(failure.message?:""))
                 lastArtworkFingerprint.set(null)
                 return@execute
             }
             val endAt=System.nanoTime()
-            val gotComplete=if(deferThis)false else try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+            val gotComplete=try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
                 catch(e:InterruptedException){Thread.currentThread().interrupt();false}
             log("artwork complete ack got=$gotComplete ms="+((System.nanoTime()-endAt)/1_000_000))
             pendingArtworkAck=null
-            if((transferId.toInt() and 1)==0){
-                deferredComplete=sessionId to transferId
-                log("artwork complete deferred id=$transferId (next artwork will close it)")
-            }else{
-                deferredComplete=null
-                log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
-                    " bytes="+jpeg.size)
-            }
+            lastArtworkCompleted=gotComplete
+            log("artwork transfer complete session=$sessionId transferId=$transferId chunks=$sent"+
+                " bytes="+jpeg.size+" ack=$gotComplete")
             // iOS 的完成回调叫 _artworkFileTransferIDSent：ID 可能是在传送真正结束之后才作数，
             // 所以完成后再各发一遍同样两种层级。
             announceArtwork(transferId,"post-complete")
