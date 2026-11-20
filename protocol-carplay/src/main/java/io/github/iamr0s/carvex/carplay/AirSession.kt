@@ -161,13 +161,15 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      *  NowPlaying subscribe group0=…,0x1a,…），我们 5001 的封面引用参数一直在发，
      *  唯一缺口就是自家 5000。修法：收到车机 5000 后把同一份参数表镜像回发
      *  （每个链接纪元一次；车机 addSubscribers 幂等，避免 5000 往复放大）。 */
-    @Volatile private var ownNowPlayingSubscribeSent=false
     private fun sendOwnNowPlayingSubscribe(fields:IapFields){
-        if(ownNowPlayingSubscribeSent)return
+        // v97(20118)：去掉"每纪元一次"去重。6.5 日志实证：车机的 5000/5002 订阅周期
+        // 全部发生在 v96 镜像到达之前（09:49:02-03 三连 vs 镜像 09:49:08）——特性启动
+        // 回调（addSubscribers→trigger 封面发布）跑的时候闸门还关着；之后 HMI 停在
+        // 媒体页，车机不再发 5000，补发永远等不到。改为每收到一条 5000 就镜像一次。
+        // 同日志实证镜像不引发车机 5000 回环（镜像后普查 5000 计数不再增长）。
         val ok=runCatching{runtime.send(NowPlayingUpdate.START,fields.ordered)}.getOrElse{
             log("[carvex.np] own 0x5000 subscribe send failed: "+(it.message?:it.javaClass.simpleName));false
         }
-        ownNowPlayingSubscribeSent=ok
         log("[carvex.np] own 0x5000 subscribe mirrored groups="+fields.ordered.size+
             " attrsGate=0x1a result="+ok)
     }
@@ -179,10 +181,18 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private val runtime:RuntimeIap=RuntimeIap({emitRuntime(it)},log,{state->
         log("Runtime iAP state="+state)
         if(state in setOf(RuntimeIapState.SYNCHRONIZING,RuntimeIapState.DEGRADED,RuntimeIapState.CLOSED))runtimeCapabilities=CapabilityRegistry()
-        if(state!=RuntimeIapState.CONTROL_READY)ownNowPlayingSubscribeSent=false
         nowPlayingPublisher.linkReady(state==RuntimeIapState.CONTROL_READY)
         runtimeChanged(state)
     },message={command->
+        // v97(20118)：拉取响应——入站 5001 的 group0/0x1a（u8）＝车机分配的封面传输号，
+        // 收到即按该报号送当前封面（固件拉取架构：车机建槽→发引用→等文件）。
+        if(command.id==NowPlayingUpdate.ID){
+            val ref=runCatching{command.fields?.ordered?.filter{it.first==0}
+                .mapNotNull{runCatching{IapWire.parseFieldList(it.second)}.getOrNull()}
+                .firstOrNull()?.ordered?.firstOrNull{it.first==0x1a}?.second}.getOrNull()
+            if(ref!=null&&ref.size==1)serveArtworkPull(ref[0])
+            else log("[carvex.np] inbound 5001 seen (no single-byte 0x1a reference); ignored")
+        }
         if(command.id in setOf(NowPlayingUpdate.START,NowPlayingUpdate.STOP,0x5003)&&
             runtimeCapabilities.sentByAccessory.any{it.value==command.id}&&
             runtimeCapabilities.receivedByAccessory.any{it.value==NowPlayingUpdate.ID}){
@@ -1286,6 +1296,69 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
      *  `cancel previous transfer: id=%d(%d) type=%d(%d) state=%d` 带 state 反推）
      *  只 cancel 未完成传输、从不 cancel 已完成传输。 */
     @Volatile private var lastArtworkCompleted=false
+    /** v97：最近一次投递的归一化 JPEG。车机拉取响应（serveArtworkPull）从这里取数。 */
+    @Volatile private var lastArtworkJpeg:ByteArray?=null
+    /** v97(20118)：车机拉取响应。固件证据链（accessoryd）：
+     *  - 封面发布唯一入口 triggerMediaItemArtworkUpdate→invokeHandler(0,0xc9,data)
+     *    （_ACCNowPlayingPlatformDelegate.nowPlayingMediaItemArtworkDidUpdate: 就是这个尾调用）；
+     *  - 处理器建条目路径：分配 bufferId → 发 5001(group0/0x1a=新id) → 等手机按这个 id 送文件；
+     *  - __handleFileTransferEnd 校验 currentTransferInfo(transferID,valid,type)，只有车机
+     *    自己发起的拉取才置位；我们自选报号的推送数据永远 valid=0 被丢弃。
+     *  6.5 日志：车机从未发过入站 5001（拉取从未发生）——车机的订阅周期全部早于 v96 镜像。
+     *  纪律：不带 5001 报号（车机已记 currentTransferInfo，再报号会走它的 cancel-previous
+     *  路径把刚建的拉取槽拆掉）；不带指纹去重（车机点名要，必须给）。 */
+    private fun serveArtworkPull(carId:Byte):Boolean {
+        val idStr=(carId.toInt() and 0xff).toString()
+        val jpeg=lastArtworkJpeg
+        if(jpeg==null){log("[carvex.np] pull id=$idStr: no artwork cached yet; ignored");return false}
+        if(pendingArtworkAck!=null){log("[carvex.np] pull id=$idStr: another transfer in flight; skipped");return false}
+        val sessionId=runtime.fileTransferSession()
+        if(sessionId==null){log("[carvex.np] pull id=$idStr: no file-transfer session");return false}
+        val negotiated=runtime.maxSessionPacketBytes()
+        val mtu=minOf(negotiated,ARTWORK_MAX_FRAME_BYTES)
+        val perPacket=mtu-2
+        if(perPacket<8){log("[carvex.np] pull skipped: iAP session MTU too small mtu=$mtu");return false}
+        artworkSender.execute{
+            runtime.resetSessionDataFailure()
+            val start=ArtworkFileTransfer.start(carId,jpeg.size.toLong(),
+                fileType=2,bufferId=(carId.toLong() and 0xff),fileName="artwork.jpg")
+            runtime.sessionInboundListener={sid,payload->onArtworkInbound(sid,payload)}
+            val ack=ArtworkAck(carId)
+            pendingArtworkAck=ack
+            log("[carvex.np] pull serve id=$idStr bytes="+jpeg.size+
+                " chunks="+((jpeg.size+perPacket-1)/perPacket)+" start sent")
+            var failure=sendArtworkPacket(sessionId,start)
+            if(failure==null){
+                val t0=System.nanoTime()
+                val gotStart=try{ack.start.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                    catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+                log("[carvex.np] pull start ack got=$gotStart ms="+((System.nanoTime()-t0)/1_000_000))
+                if(gotStart){
+                    var offset=0;var sent=0
+                    while(offset<jpeg.size&&failure==null){
+                        val end=minOf(jpeg.size,offset+perPacket)
+                        failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.chunk(carId,jpeg.copyOfRange(offset,end)))
+                        if(failure==null){
+                            offset=end;sent++
+                            if(sent%4==0)Thread.sleep(20)
+                        }
+                    }
+                }
+                if(failure==null){
+                    failure=sendArtworkPacket(sessionId,ArtworkFileTransfer.complete(carId))
+                    if(failure==null){
+                        val t1=System.nanoTime()
+                        val gotComplete=try{ack.complete.await(1200,java.util.concurrent.TimeUnit.MILLISECONDS)}
+                            catch(e:InterruptedException){Thread.currentThread().interrupt();false}
+                        log("[carvex.np] pull complete ack got=$gotComplete ms="+((System.nanoTime()-t1)/1_000_000))
+                    }
+                }
+            }
+            pendingArtworkAck=null
+            log("[carvex.np] pull serve done id=$idStr failure="+(failure?.let{it.javaClass.simpleName}?:"none"))
+        }
+        return true
+    }
     private fun nextArtworkTransferId():Byte {
         // 0 留给"没有传输"，其余循环使用；同一时刻只跑一条传输。
         val next=artworkTransferId.updateAndGet{value->if(value>=255)1 else value+1}
@@ -1369,6 +1442,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         val jpeg=jpegIn
         val fileName="artwork.jpg"
         log("artwork payload form=jpeg bytes="+jpeg.size+" name="+fileName)
+        lastArtworkJpeg=jpeg
         if(System.getProperty("carvex.artwork.transfer")?.trim()=="0"){
             log("artwork transfer disabled by carvex.artwork.transfer=0; id only")
             return false
