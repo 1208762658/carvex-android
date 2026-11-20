@@ -1322,28 +1322,18 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         return sent
     }
 
-    /** 交替探针：奇数张发 JPEG，偶数张发 PNG，看车机认哪种编码。 */
+    /** 交替探针已废弃（v93 关闭，见 artwork() 内注释）：恒定 JPEG。 */
     @Volatile private var lastArtworkTransferId:Byte? = null
-    private val artworkPngNext=java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun artwork(jpegIn:ByteArray):Boolean {
-        val usePng=artworkPngNext.get()
-        artworkPngNext.set(!usePng)
-        var jpeg=jpegIn
-        var fileName="artwork.jpg"
-        if(usePng){
-            val png=runCatching{
-                val bmp=android.graphics.BitmapFactory.decodeByteArray(jpegIn,0,jpegIn.size)
-                    ?: return@runCatching null
-                val out=java.io.ByteArrayOutputStream()
-                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG,100,out)
-                bmp.recycle()
-                out.toByteArray()
-            }.getOrNull()
-            if(png!=null&&png.isNotEmpty()){jpeg=png;fileName="artwork.png"}
-        }
-        log("artwork payload form="+(if(fileName.endsWith(".png"))"png" else "jpeg")+
-            " bytes="+jpeg.size+" name="+fileName)
+        // v93(20107) 关闭 v69 的 JPEG/PNG 交替实验（commit 1f6efe9）：6.2 实车日志
+        // （3ea013bd，transferId 2..6）证明 55337/321056 字节交替不是两张不同封面，
+        // 而是本函数把同一张图轮流编成两种格式、fileName 随之在 artwork.jpg/artwork.png
+        // 之间切换——车机封面槽每 15 秒换一次解码格式，永远拿不到稳定形态。
+        // 恒定 JPEG（归一管线的原生输出），字节形态与文件名一致，不再引入第二种编码。
+        val jpeg=jpegIn
+        val fileName="artwork.jpg"
+        log("artwork payload form=jpeg bytes="+jpeg.size+" name="+fileName)
         if(System.getProperty("carvex.artwork.transfer")?.trim()=="0"){
             log("artwork transfer disabled by carvex.artwork.transfer=0; id only")
             return false

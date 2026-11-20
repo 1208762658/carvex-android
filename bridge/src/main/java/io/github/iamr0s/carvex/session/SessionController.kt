@@ -286,6 +286,8 @@ class SessionController(
                 distanceRemaining=s.remainMeters?.toLong()?.takeIf{it>=0},
                 distanceDisplay=s.remainText(),
                 distanceUnits=s.distanceUnits,
+                distanceToManeuver=s.toManeuverMeters?.toLong()?.takeIf{it>=0},
+                distanceToManeuverDisplay=s.maneuverText(),
                 maneuverList=if(maneuverType!=null)listOf(0) else emptyList(),
                 maneuverCount=if(maneuverType!=null)1 else null,
                 beingShown=true))
@@ -293,7 +295,7 @@ class SessionController(
                 val routeSent=air.navigationRouteUpdate(route)
                 BridgeStore.log(id,"[carvex.nav] 5201 sent=$routeSent road=${s.road?:"-"} remain=${s.remainMeters?.toString()?:"-"} display=${s.remainText()?:"-"} state=${s.state?.toString()?:"-"}")
                 if(maneuverType==null){
-                    BridgeStore.log(id,"[carvex.nav] 5202 skipped: maneuver type not calibrated")
+                    BridgeStore.log(id,"[carvex.nav] 5202 skipped: turn=0 (no maneuver data)")
                     return@launch
                 }
                 val maneuver=NavigationGuidance.maneuver(NavigationGuidance.ManeuverUpdate(
@@ -303,7 +305,9 @@ class SessionController(
                     afterRoad=s.road?.takeIf{it.isNotEmpty()},
                     distance=s.toManeuverMeters?.toLong()?.takeIf{it>=0},
                     distanceDisplay=s.maneuverText(),
-                    distanceUnits=s.distanceUnits))
+                    distanceUnits=s.distanceUnits,
+                    drivingSide=1,
+                    junctionType=0))
                 val maneuverSent=air.navigationManeuverUpdate(maneuver)
                 BridgeStore.log(id,"[carvex.nav] 5202 sent=$maneuverSent type=$maneuverType to=${s.toManeuverMeters?.toString()?:"-"} display=${s.maneuverText()?:"-"}")
             }
@@ -467,11 +471,16 @@ class SessionController(
                         // 上下文疑似被车机整体丢弃。改推真实 HUD 一套齐：真实路名+真实剩余距离+
                         // 原始 navi_turn。转向枚举仍未标定（可能错箭头，实车观察反馈即可）；
                         // turn=0 表示无转向信息，保持不推机动。
+                        // v93(20107) 固件反汇编补字段：__convertRouteGuidanceStateTypeForFunc
+                        // 证明 RouteGuidanceState 合法域 0-6（引导中=1）；5202 的 drivingSide
+                        // 仅接受 0/1（中国右行=1），junctionType 0=普通路口。参数序已由
+                        // keyForType 全表（5201 26 参/5202 13 参）证实与编码器一致。
                         pushSnapshot(NavigationSnapshot(
                             road=road.takeIf{it.isNotEmpty()},
                             remainMeters=remain.takeIf{it>=0},
                             toManeuverMeters=remain.takeIf{it>=0},
-                            maneuverType=turn.takeIf{it!=0}))
+                            maneuverType=turn.takeIf{it!=0},
+                            state=if(road.isNotEmpty()||turn!=0)1 else null))
                         BridgeStore.log(id,"[carvex.nav] hud road=$road remain=$remain turn=$turn")
                     }
                     "carlife_change_theme"->{
