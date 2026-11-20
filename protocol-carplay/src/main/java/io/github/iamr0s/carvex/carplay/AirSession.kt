@@ -188,8 +188,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // 收到即按该报号送当前封面（固件拉取架构：车机建槽→发引用→等文件）。
         if(command.id==NowPlayingUpdate.ID){
             val ref=runCatching{command.fields?.ordered?.filter{it.first==0}
-                .mapNotNull{runCatching{IapWire.parseFieldList(it.second)}.getOrNull()}
-                .firstOrNull()?.ordered?.firstOrNull{it.first==0x1a}?.second}.getOrNull()
+                ?.mapNotNull{runCatching{IapWire.parseFieldList(it.second)}.getOrNull()}
+                ?.firstOrNull()?.ordered?.firstOrNull{it.first==0x1a}?.second}.getOrNull()
             if(ref!=null&&ref.size==1)serveArtworkPull(ref[0])
             else log("[carvex.np] inbound 5001 seen (no single-byte 0x1a reference); ignored")
         }
