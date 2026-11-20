@@ -149,6 +149,28 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private fun micTeardownDescriptor():Map<String,Any?> = AudioTeardownDescriptor.forType(100)
     @Volatile private var runtimeCapabilities=CapabilityRegistry()
     private val nowPlayingPublisher=NowPlayingPublisher{runtime.send(NowPlayingUpdate.ID,it)}
+    /** v96(20110)：固件反汇编结论（accessoryd）——封面事件处理器（sub-feature 0xc9，
+     *  _iap2_nowPlaying_mediaItemArtworkUpdateHandler@0x100145e70）入口有订阅闸门
+     *  __isSubscribingForMediaItemAttribute@0x1000815ac：检查本端点订阅列表里是否有
+     *  属性 0x1a（MediaItemArtworkFileTransferIdentifier），未订阅直接 bail（cbz→出口），
+     *  根本走不到 findTransferEntry/建条目路径。订阅列表由 __startNowPlayingUpdatesHandler
+     *  （入站 0x5000 处理器，带 addSubscribers block）解析手机发来的 5000 参数表后写入。
+     *  我们从未发过自己的 5000 → 永远未订阅 → 传输再完美也不渲染（6.4 日志全吻合：
+     *  元数据通=属性事件 0xc8 无闸门；传输 340/340 全绿=文件层无关；无车机拉取、
+     *  无幽灵条目=创建路径从未执行）。车机订阅 group0 实测含 0x1a（6.4 日志
+     *  NowPlaying subscribe group0=…,0x1a,…），我们 5001 的封面引用参数一直在发，
+     *  唯一缺口就是自家 5000。修法：收到车机 5000 后把同一份参数表镜像回发
+     *  （每个链接纪元一次；车机 addSubscribers 幂等，避免 5000 往复放大）。 */
+    @Volatile private var ownNowPlayingSubscribeSent=false
+    private fun sendOwnNowPlayingSubscribe(fields:IapFields){
+        if(ownNowPlayingSubscribeSent)return
+        val ok=runCatching{runtime.send(NowPlayingUpdate.START,fields.ordered)}.getOrElse{
+            log("[carvex.np] own 0x5000 subscribe send failed: "+(it.message?:it.javaClass.simpleName));false
+        }
+        ownNowPlayingSubscribeSent=ok
+        log("[carvex.np] own 0x5000 subscribe mirrored groups="+fields.ordered.size+
+            " attrsGate=0x1a result="+ok)
+    }
     private fun emitRuntime(bytes:ByteArray):Boolean{
         if(stopping||!options.experiment)return false
         tunnel?.let{return it.send(bytes)}
@@ -157,6 +179,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     private val runtime:RuntimeIap=RuntimeIap({emitRuntime(it)},log,{state->
         log("Runtime iAP state="+state)
         if(state in setOf(RuntimeIapState.SYNCHRONIZING,RuntimeIapState.DEGRADED,RuntimeIapState.CLOSED))runtimeCapabilities=CapabilityRegistry()
+        if(state!=RuntimeIapState.CONTROL_READY)ownNowPlayingSubscribeSent=false
         nowPlayingPublisher.linkReady(state==RuntimeIapState.CONTROL_READY)
         runtimeChanged(state)
     },message={command->
@@ -238,6 +261,9 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     // and the next on-car log shows it.
                     val ok4=runtime.send(0x4300,listOf(0 to byteArrayOf(1)))
                     log("VW-866F new-protocol 0x4300 sent="+ok4+" after old-path signals (CSDN new-protocol CarPlay availability+transport; not advertised by 866F)")
+                    // v96(20110)：订阅闸门镜像——所有既有序列（4e0d/4e0e/4e0b/4300）保持
+                    // 原顺序不动，最后补发自家 0x5000（镜像车机参数表），让封面闸门放行。
+                    sendOwnNowPlayingSubscribe(subscribeFields)
                 }
             }
         }else{
@@ -907,6 +933,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // 否则车机的订阅在 Bootstrap 里被当未知命令丢弃，之后永远不会收到 5001。
         nowPlayingPublisher.linkReady(true)
         NowPlayingUpdate.pendingSubscription?.let{
+            // v96：先补自家 5000 订阅（闸门放行），再回放车机订阅并推默认态/快照。
+            sendOwnNowPlayingSubscribe(it)
             nowPlayingPublisher.command(NowPlayingUpdate.START,it)
             NowPlayingUpdate.pendingSubscription=null
             log("Now Playing subscription replayed from bootstrap")
