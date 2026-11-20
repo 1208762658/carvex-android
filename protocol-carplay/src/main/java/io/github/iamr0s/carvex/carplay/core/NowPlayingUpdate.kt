@@ -213,6 +213,13 @@ class NowPlayingPublisher(private val emit:(List<Pair<Int,ByteArray>>)->Boolean)
     @Synchronized fun update(delta:NowPlayingUpdate.Track,replaceMedia:Boolean=false):Boolean {
         // Validate even before a subscriber exists, so bad ranges are never cached.
         NowPlayingUpdate.fields(delta)
+        // v98(20120)：修复"封面引用活不过一条消息"。旧实现重建 snapshot 时漏掉
+        // artworkTransferId，导致每条元数据更新都把它清成 null；且本方法发送的是
+        // delta 而非合并后的状态，引用根本不会随常规更新持续存在——车机看到的是
+        // "0x1a 引用出现约 1 秒后消失"。0x1a 是状态不是事件：必须随每条 5001 存活，
+        // 直到 artwork(newId) 显式替换。replaceMedia 只重置媒体字段，不清封面引用
+        // （旧 id 的文件仍在传输槽里有效，v94 槽位纪律）。
+        val prior=snapshot
         val old=if(replaceMedia)NowPlayingUpdate.Track() else snapshot
         snapshot=NowPlayingUpdate.Track(delta.title?:old.title,delta.artist?:old.artist,delta.album?:old.album,
             delta.durationMs?:old.durationMs,delta.elapsedMs?:old.elapsedMs,delta.queueIndex?:old.queueIndex,
@@ -226,8 +233,10 @@ class NowPlayingPublisher(private val emit:(List<Pair<Int,ByteArray>>)->Boolean)
             delta.itunesRadioStation?:old.itunesRadioStation,
             delta.itunesRadioStationMediaPlaylistPersistentId?:old.itunesRadioStationMediaPlaylistPersistentId,
             delta.playbackSpeed?:old.playbackSpeed,delta.setTimeElapsedAvailable?:old.setTimeElapsedAvailable,
-            delta.appBundleId?:old.appBundleId)
-        return send(delta)
+            delta.appBundleId?:old.appBundleId,
+            delta.artworkTransferId?:prior.artworkTransferId)
+        // 发送合并后的完整状态（与 setInfo 一致），封面引用随每条 5001 持续在场。
+        return send(snapshot)
     }
     private fun send(track:NowPlayingUpdate.Track):Boolean {
         val selected=selection?:return false

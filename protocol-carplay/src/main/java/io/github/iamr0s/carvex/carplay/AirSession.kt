@@ -148,7 +148,18 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     @Volatile private var micStreamId:Long?=null
     private fun micTeardownDescriptor():Map<String,Any?> = AudioTeardownDescriptor.forType(100)
     @Volatile private var runtimeCapabilities=CapabilityRegistry()
-    private val nowPlayingPublisher=NowPlayingPublisher{runtime.send(NowPlayingUpdate.ID,it)}
+    /** v98：观测点——每条 5001 更新若携带 0x1a 封面引用则记日志（值变化时才记，防刷屏），
+     *  用于验证"引用随状态持续在场"。 */
+    @Volatile private var lastLoggedArtworkRef:Byte?=null
+    private val nowPlayingPublisher=NowPlayingPublisher{fields->
+        val ref=runCatching{fields.firstOrNull{it.first==0}?.second?.let{IapWire.parseFieldList(it)}
+            ?.ordered?.firstOrNull{it.first==0x1a}?.second?.getOrNull(0)}.getOrNull()
+        if(ref!=null&&ref!=lastLoggedArtworkRef){
+            lastLoggedArtworkRef=ref
+            log("[carvex.np] 5001 update carries artworkRef="+(ref.toInt() and 0xff))
+        }
+        runtime.send(NowPlayingUpdate.ID,fields)
+    }
     /** v96(20110)：固件反汇编结论（accessoryd）——封面事件处理器（sub-feature 0xc9，
      *  _iap2_nowPlaying_mediaItemArtworkUpdateHandler@0x100145e70）入口有订阅闸门
      *  __isSubscribingForMediaItemAttribute@0x1000815ac：检查本端点订阅列表里是否有
