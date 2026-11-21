@@ -198,6 +198,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // v97(20118)：拉取响应——入站 5001 的 group0/0x1a（u8）＝车机分配的封面传输号，
         // 收到即按该报号送当前封面（固件拉取架构：车机建槽→发引用→等文件）。
         if(command.id==NowPlayingUpdate.ID){
+            // v102(20124)：入站 5001 全量原文（此前只有"无报号"一行，车机若以 5001
+            // 形态报号（Path B 响应消息 id 未钉死）将完全不可见）。入站 5001 极罕见，
+            // 无刷屏风险。
+            val rawFields=command.fields
+            if(rawFields!=null)log("[carvex.np] inbound 0x5001 raw="+rawFields.ordered.joinToString("|"){
+                String.format("%02x:",it.first)+it.second.joinToString(""){b->String.format("%02x",b)} })
             val ref=runCatching{command.fields?.ordered?.filter{it.first==0}
                 ?.mapNotNull{runCatching{IapWire.parseFieldList(it.second)}.getOrNull()}
                 ?.firstOrNull()?.ordered?.firstOrNull{it.first==0x1a}?.second}.getOrNull()
@@ -207,7 +213,23 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         if(command.id in setOf(NowPlayingUpdate.START,NowPlayingUpdate.STOP,0x5003)&&
             runtimeCapabilities.sentByAccessory.any{it.value==command.id}&&
             runtimeCapabilities.receivedByAccessory.any{it.value==NowPlayingUpdate.ID}){
-            if(command.id==0x5003)nowPlayingPublisher.setInfo(requireNotNull(command.fields))
+            if(command.id==0x5003){
+                val infoFields=requireNotNull(command.fields)
+                nowPlayingPublisher.setInfo(infoFields)
+                // v102(20124)：同款报号检测兜底——Path B（mediaItemArtworkUpdateHandler
+                // 0x100145e70）也构造带 AddU8Param(0x1a,carId) 的响应消息，其消息 id 未在
+                // 反汇编中钉死（5000/5001/5003 皆可能）。命中即接线，serveArtworkPull
+                // 自带单飞与缓存守卫，误触发无副作用。
+                val ann=infoFields.ordered.filter{it.first==0}.mapNotNull{runCatching{
+                    IapWire.parseFieldList(it.second)}.getOrNull()}.firstOrNull()?.ordered
+                    ?.firstOrNull{(it.first==0x1a)&&it.second.size==1}
+                val carId3=ann?.second?.getOrNull(0)
+                if(carId3!=null){
+                    log("[carvex.np] car 0x5003 carries artwork announce carId="+
+                        (carId3.toInt() and 0xff)+" -> serve pull")
+                    serveArtworkPull(carId3)
+                }
+            }
             else{
                 val subscribeFields=requireNotNull(command.fields)
                 if(command.id==NowPlayingUpdate.START){
@@ -223,6 +245,21 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                     log("NowPlaying subscribe group0="+g0?.joinToString(","){String.format("0x%02x",it)})
                     log("NowPlaying subscribe group1="+g1?.joinToString(","){String.format("0x%02x",it)})
                     log("NowPlaying subscribe group2="+g2?.joinToString(","){String.format("0x%02x",it)})
+                    // v102(20124)：Path A 报号检测。固件响应构造器（0x10014a53c）把车机分配
+                    // 的封面号以 AddU8Param(msg, group0, 0x1a, carId) 塞进对 5000 的响应——
+                    // 编码为 group0 内 0005 001a XX（带 1 字节载荷）。车机周期性订阅自身的
+                    // 0x1a 是 void（0004 001a），size==1 过滤即可区分。v97 只挂了 5001 路，
+                    // 这是真盲区。同时兜底扫顶层 0x1a u8。命中即自动接线 serveArtworkPull。
+                    val annG0=subscribeFields.ordered.filter{it.first==0}.mapNotNull{runCatching{
+                        IapWire.parseFieldList(it.second)}.getOrNull()}.firstOrNull()?.ordered
+                        ?.firstOrNull{(it.first==0x1a)&&it.second.size==1}
+                    val annTop=subscribeFields.ordered.firstOrNull{(it.first==0x1a)&&it.second.size==1}
+                    val carId=annG0?.second?.getOrNull(0)?:annTop?.second?.getOrNull(0)
+                    if(carId!=null){
+                        log("[carvex.np] car 0x5000 carries artwork announce carId="+
+                            (carId.toInt() and 0xff)+" inGroup0="+(annG0!=null)+" -> serve pull")
+                        serveArtworkPull(carId)
+                    }
                 }
                 nowPlayingPublisher.command(command.id,subscribeFields)
                 if(command.id==NowPlayingUpdate.START){
