@@ -1456,7 +1456,8 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         // 恒定 JPEG（归一管线的原生输出），字节形态与文件名一致，不再引入第二种编码。
         val jpeg=jpegIn
         val fileName="artwork.jpg"
-        log("artwork payload form=jpeg bytes="+jpeg.size+" name="+fileName)
+        log("artwork payload form=jpeg bytes="+jpeg.size+" name="+fileName+
+            " dataPlane="+(if(ArtworkFileTransfer.DATA_PLANE_V99) "v99(type2+0x80/0x40)" else "v98gate-off(type3,peer-drops)"))
         lastArtworkJpeg=jpeg
         if(System.getProperty("carvex.artwork.transfer")?.trim()=="0"){
             log("artwork transfer disabled by carvex.artwork.transfer=0; id only")

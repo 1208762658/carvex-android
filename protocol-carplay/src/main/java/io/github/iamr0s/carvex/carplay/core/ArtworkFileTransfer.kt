@@ -35,11 +35,34 @@ package io.github.iamr0s.carvex.carplay.core
  */
 object ArtworkFileTransfer {
     const val TYPE_START=4
+    /** v100(20122)：数据面运行时闸门，默认关。
+     *
+     *  背景：v99 数据面（type 2 + 0x80/0x40）让车机史上第一次真正拼装并入库了我们的
+     *  封面文件。此后两次冷车点火首连（11-20 21:07 / 11-21 08:28 本地）车机在握手/
+     *  媒体阶段硬冻死重启；关键对照：11-19 21:06 v98 同深度握手良性超时、车机无恙，
+     *  11-20 21:07 v99 同流量车机冻死——同流量不同结局，唯一状态差=v99 已向车机
+     *  持久层写入封面文件。判定为"文件入库→冷车加载噎死"循环，按【最小阻力原则】
+     *  单变量回退数据面。
+     *
+     *  闸门关（默认）= 精确恢复 v98 行为：分块 type 3（车机发送方向操作码，被静默
+     *  丢弃）、不带任何旗标——车机永远拼不出文件，Success 路径不再触发，持久层不再
+     *  收到我们的新文件，毒循环断供。
+     *  闸门开 = 恢复 v99 行为（type 2 + first|0x80 / last|0x40），用于单会话 A/B 复测。
+     *  运行时开关：`-Dcarvex.art.data.v99=1`（系统属性），与 carvex.artwork.transfer 同
+     *  一套机制；关闭时 START/COMPLETE 照发（与 v98 完全一致），开/关只影响分块字节。 */
+    val DATA_PLANE_V99: Boolean
+        get()=System.getProperty("carvex.art.data.v99")?.trim()=="1"
+
+    /** v98 数据面操作码：车机 `_iAP2FileTransferHandleRecv`（0x10006de9c）里 type 3 是
+     *  它自己的发送/应答方向，accessory 发的 type 3 在 state=8 时仅切 state 8→9 并丢
+     *  载荷（0x10006e328）——即"发出去、车机不收"的既有安全行为。 */
+    const val TYPE_CHUNK_V98=3
     // v99(20121)：分块 type 3→2。固件 `_iAP2FileTransferHandleRecv`（0x10006de9c）里
     // type 2 才是 accessory→车机的数据分支（state {2,3,8,9} 接收，0x10006e4a4 分派）；
     // type 3 是车机自己的数据发送/应答方向——我们 state=8 时收到 type 3 只会切 state 8→9
     // 并丢载荷（0x10006e328），后续 type 3 直接落"unexpected state"日志分支。v98 及之前
     // 63/64 个分块全部被丢，文件从未在车机侧拼装，artwork 缓存恒空 → 框架绿方块。
+    // v100(20122)：该常量仅在闸门 DATA_PLANE_V99 开启时生效，见 chunk()。
     const val TYPE_CHUNK=2
     const val TYPE_COMPLETE=5
     // iOS 侧 `_iAP2FileTransferDelete` 对应线上的 type 6。iPhone 在新封面到来时
@@ -90,6 +113,11 @@ object ArtworkFileTransfer {
     const val CHUNK_FLAG_LAST=0x40
     fun chunk(transferId:Byte,body:ByteArray,first:Boolean=false,last:Boolean=false):ByteArray {
         require(body.isNotEmpty()){"empty file-transfer chunk"}
+        if(!DATA_PLANE_V99){
+            // v100 闸门关（默认）：v98 数据面——type 3、无旗标。车机把分块静默丢弃，
+            // Success 不触发，文件不入库。START/COMPLETE 照发，链路语义与 v98 全等。
+            return byteArrayOf(transferId,TYPE_CHUNK_V98.toByte())+body
+        }
         var type=TYPE_CHUNK
         if(first)type=type or CHUNK_FLAG_FIRST
         if(last)type=type or CHUNK_FLAG_LAST
