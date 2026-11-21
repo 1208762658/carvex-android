@@ -22,13 +22,16 @@ import java.net.URL
 internal object CarLifeArtwork {
     /** 封面显示区很小，iPhone 也只发缩略图；256 边足够，且能让整张图落在几十个分块内。 */
     private const val JPEG_QUALITY = 88
-    /** 4.0 起做尺寸对照：车机对封面尺寸有偏好（原生媒体区常见 600 起），
-     *  一张 256、一张 600 轮流发，一次驾驶就能看出"尺寸是不是门"。
-     *  两种都远低于 254KB 的单帧上限，也都在几十个分块之内。 */
+    /** v101(20123)：250 = 原生尺寸直出，停用 4.2 起的"放大到 600"实验遗留。
+     *  背景：4.2 的尺寸对照实验从未完成（v99 之前文件在车机侧从未拼装成功，无结论）；
+     *  v99 首次把 600x600 文件送进车机 Success→缓存路径后，两次冷车点火车机硬冻死
+     *  （11-20 21:07 / 11-21 08:28 本地），v100 已用闸门定罪"文件规格"维度。
+     *  重启封面线的第一变量选原生尺寸：CarWith 递来的 Bitmap 恒 250x250，本机直出
+     *  零重采样（scaleDown 对 edge==maxEdge 原样返回）；250 级 JPEG 是车机从
+     *  AVRCP/CarWith 原生封面就在处理的字节级，且体量比 600x600 砍约 4 倍，
+     *  持久化足迹最小。URL 原图大于 250 时仍只缩小不放大。 */
     private val edgeRotation = java.util.concurrent.atomic.AtomicInteger(0)
-    /** 4.0/4.1 里 288/600 轮流发都没出图，且都偏小；VW 原生媒体区常见 600 起，
-     *  4.2 起固定 600，把"尺寸"这个变量单独钉死，避免和编码对照混在一起。 */
-    private fun nextMaxEdge(): Int { edgeRotation.getAndIncrement(); return 600 }
+    private fun nextMaxEdge(): Int { edgeRotation.getAndIncrement(); return 250 }
     /** 网络/文件读取上限：再大就不是封面了。 */
     private const val MAX_SOURCE_BYTES = 2 * 1024 * 1024
     private val ARTWORK_KEYS = listOf("cover", "artwork", "MediaAlbumArt", "MediaArtwork")

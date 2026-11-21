@@ -35,23 +35,20 @@ package io.github.iamr0s.carvex.carplay.core
  */
 object ArtworkFileTransfer {
     const val TYPE_START=4
-    /** v100(20122)：数据面运行时闸门，默认关。
+    /** v101(20123)：数据面闸门默认开（v99 行为 type 2 + 0x80/0x40）。
      *
-     *  背景：v99 数据面（type 2 + 0x80/0x40）让车机史上第一次真正拼装并入库了我们的
-     *  封面文件。此后两次冷车点火首连（11-20 21:07 / 11-21 08:28 本地）车机在握手/
-     *  媒体阶段硬冻死重启；关键对照：11-19 21:06 v98 同深度握手良性超时、车机无恙，
-     *  11-20 21:07 v99 同流量车机冻死——同流量不同结局，唯一状态差=v99 已向车机
-     *  持久层写入封面文件。判定为"文件入库→冷车加载噎死"循环，按【最小阻力原则】
-     *  单变量回退数据面。
+     *  时间线：v99 数据面让车机史上第一次真正拼装并入库了我们的封面文件，随后两次
+     *  冷车点火首连车机在握手/媒体阶段硬冻死重启；v100 闸门默认关（v98 数据面）后
+     *  车机稳定，定罪"600x600 文件规格"维度。v101 以新单变量重启封面线：文件规格
+     *  改为原生 250x250（CarLifeArtwork.nextMaxEdge），数据面恢复开闸实测——
+     *  用户无 adb，闸门翻转必须内建出包，无法运行时切换。
      *
-     *  闸门关（默认）= 精确恢复 v98 行为：分块 type 3（车机发送方向操作码，被静默
-     *  丢弃）、不带任何旗标——车机永远拼不出文件，Success 路径不再触发，持久层不再
-     *  收到我们的新文件，毒循环断供。
-     *  闸门开 = 恢复 v99 行为（type 2 + first|0x80 / last|0x40），用于单会话 A/B 复测。
-     *  运行时开关：`-Dcarvex.art.data.v99=1`（系统属性），与 carvex.artwork.transfer 同
-     *  一套机制；关闭时 START/COMPLETE 照发（与 v98 完全一致），开/关只影响分块字节。 */
+     *  闸门关 = 精确恢复 v98 行为：分块 type 3（车机发送方向操作码，被静默丢弃）、
+     *  不带任何旗标——车机永远拼不出文件，Success 路径不再触发，持久层不再收到
+     *  我们的新文件。系统属性 `carvex.art.data.v99=0` 可强制关（诊断用）。
+     *  关闭时 START/COMPLETE 照发（与 v98 完全一致），开/关只影响分块字节。 */
     val DATA_PLANE_V99: Boolean
-        get()=System.getProperty("carvex.art.data.v99")?.trim()=="1"
+        get()=System.getProperty("carvex.art.data.v99")?.trim()!="0"
 
     /** v98 数据面操作码：车机 `_iAP2FileTransferHandleRecv`（0x10006de9c）里 type 3 是
      *  它自己的发送/应答方向，accessory 发的 type 3 在 state=8 时仅切 state 8→9 并丢
