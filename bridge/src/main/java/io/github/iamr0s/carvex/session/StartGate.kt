@@ -53,9 +53,15 @@ internal object StartGate {
         return value.coerceIn(0, MAX_DELAY_SEC)
     }
 
-    /** 蓝牙就绪后额外等 Wi-Fi 租约的窗口。5.3：Wi-Fi 常常在会话建立之后才到。 */
+    /** 蓝牙就绪后额外等 Wi-Fi 租约的窗口。
+     *  v103(20125)：默认 5000→0。7.2 日志双样本（4aec3708/7efcd360，20124）实测：
+     *  软条件在两场会话都精确烧满 5000ms 从未命中——5.3 证据链 Wi-Fi 要 +26s 才
+     *  available（CarWith 连热点发生在会话建立之后），任何等待窗口都追不上；
+     *  phone STA 状态在 WiAP Source 模式下与建连无关（handshake succeeds without
+     *  WLAN, car joins later）。5.2 失败场景（RFCOMM 先于 ACL）由硬条件 ACL 判据
+     *  单独防守，与软等待无关。回退：carvex.startGate.wifiWaitMs=5000。 */
     fun wifiWaitMs(): Long =
-        sysProp("carvex.startGate.wifiWaitMs", "").toLongOrNull()?.coerceIn(0L, 30_000L) ?: 5_000L
+        sysProp("carvex.startGate.wifiWaitMs", "").toLongOrNull()?.coerceIn(0L, 30_000L) ?: 0L
 
     private fun timeoutMs(): Long =
         sysProp("carvex.startGate.timeoutMs", "").toLongOrNull()?.coerceIn(1_000L, 60_000L)
