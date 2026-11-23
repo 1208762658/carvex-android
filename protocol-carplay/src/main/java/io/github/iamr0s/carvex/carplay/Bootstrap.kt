@@ -438,41 +438,53 @@ object Bootstrap {
                                 round++
                                 log("RFCOMM window probe round=$round parallel channels=1..6"+
                                     " (car opens the window only after the driver taps CarPlay)")
-                                coroutineScope{
-                                    (1..6).map{channel->async(Dispatchers.IO){
-                                        if(stopping.get()||winner.isCompleted)return@async
-                                        val raw=rawRfcommSocket(device,channel)
-                                        if(raw==null){
-                                            log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
-                                            return@async
+                                // v104(20126)：探测通道改为独立脱离作用域（SupervisorJob），
+                                // 赢家产生即放行。7.3 日志 b46509e9：ch4/ch5 的 connect() 各挂
+                                // 36.1s（6s killer 关 socket 关不掉内核态 connect），awaitAll 被
+                                // 拖满 36s——已选中的 ch3 健康通道进不了 iAP，整体 attempt 预算
+                                // 烧完当场终结（首连秒挂的管线级机制）。仓库惯用法参照本文件
+                                // persistent WiAP publication 的 SupervisorJob+IO 用法。
+                                val probeScope=kotlinx.coroutines.CoroutineScope(SupervisorJob()+Dispatchers.IO)
+                                val probes=(1..6).map{channel->probeScope.launch{
+                                    if(stopping.get()||winner.isCompleted)return@launch
+                                    val raw=rawRfcommSocket(device,channel)
+                                    if(raw==null){
+                                        log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
+                                        return@launch
+                                    }
+                                    r.own(raw);activeOutbound.set(raw)
+                                    val startedAt=android.os.SystemClock.elapsedRealtime()
+                                    log("RFCOMM raw channel=$channel attempt (SDP bypass)")
+                                    trace("tx","channel$channel","attempt","RAW_CHANNEL")
+                                    // connect() 自己不会超时；并发拨号时必须有看门狗把它的
+                                    // 5s 上限兜住，否则一轮又会被最慢的通道拖回 35s。
+                                    val killer=launch{delay(6_000);runCatching{raw.close()}}
+                                    try{
+                                        raw.connect()
+                                        killer.cancel()
+                                        activeOutbound.compareAndSet(raw,null)
+                                        if(stopping.get()||winnerSocket.get()!=null){
+                                            r.release(raw);return@launch
                                         }
-                                        r.own(raw);activeOutbound.set(raw)
-                                        val startedAt=android.os.SystemClock.elapsedRealtime()
-                                        log("RFCOMM raw channel=$channel attempt (SDP bypass)")
-                                        trace("tx","channel$channel","attempt","RAW_CHANNEL")
-                                        // connect() 自己不会超时；并发拨号时必须有看门狗把它的
-                                        // 5s 上限兜住，否则一轮又会被最慢的通道拖回 35s。
-                                        val killer=launch{delay(6_000);runCatching{raw.close()}}
-                                        try{
-                                            raw.connect()
-                                            killer.cancel()
-                                            activeOutbound.compareAndSet(raw,null)
-                                            if(stopping.get()||winnerSocket.get()!=null){
-                                                r.release(raw);return@async
-                                            }
-                                            log("RFCOMM raw channel=$channel connected without SDP")
-                                            select(raw,"channel$channel")
-                                        }catch(t:Exception){
-                                            killer.cancel()
-                                            activeOutbound.compareAndSet(raw,null)
-                                            if(t is CancellationException)throw t
-                                            if(winnerSocket.get()!==raw)r.release(raw)
-                                            val el=android.os.SystemClock.elapsedRealtime()-startedAt
-                                            log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
-                                            lastRaw=t
-                                        }
-                                    }}.awaitAll()
-                                }
+                                        log("RFCOMM raw channel=$channel connected without SDP")
+                                        select(raw,"channel$channel")
+                                    }catch(t:Exception){
+                                        killer.cancel()
+                                        activeOutbound.compareAndSet(raw,null)
+                                        if(t is CancellationException)return@launch
+                                        if(winnerSocket.get()!==raw)r.release(raw)
+                                        val el=android.os.SystemClock.elapsedRealtime()-startedAt
+                                        log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
+                                        lastRaw=t
+                                    }
+                                }}
+                                // v104：赢家产生即放行——只等赢家，绝不等最慢的未决通道。
+                                // 未决探测在独立作用域里自生自灭（connect 由内核超时或 6s
+                                // killer 收尾，资源由 catch 分支释放），绝不阻塞已选中健康
+                                // 通道进入 iAP 的管线。
+                                while(!winner.isCompleted&&probes.any{it.isActive}&&
+                                    android.os.SystemClock.elapsedRealtime()<windowUntil)delay(50)
+                                if(winner.isCompleted)probes.forEach{runCatching{it.cancel()}}
                                 last=lastRaw?:last
                                 if(stopping.get()||winner.isCompleted)break
                                 delay(400)
