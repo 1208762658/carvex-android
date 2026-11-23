@@ -491,7 +491,15 @@ object Bootstrap {
                             }
                         }
                         activeOutbound.set(null)
-                        if(isActive&&!stopping.get()){
+                        // v105(20127)：失败上报只允许发生在"没有赢家"时。7.4 日志
+                        // 946610d8/c8947237/fd1d52e9：裸通道 ch3/ch2 已选中并进入 iAP
+                        //（Detect attempt=1 已发），但本行仍以 lastRaw 的 read ret:-1
+                        // 把 attempt 宣告为失败，SessionController 按"一次 attempt=一次
+                        // 失败"当场终结会话（选中后 ~1.3s attempt ended）。裸兜底路径
+                        // 自 v51 起从未真正交付过连接——v103 时代被 36s 人质掩盖成超时
+                        // 假象，v104 赢家即放行后暴露为 3.5s 速死。赢家在场时交由 iAP
+                        // 阶段自行定成败（其失败有独立计数路径）。
+                        if(isActive&&!stopping.get()&&winnerSocket.get()==null){
                             // 这里只把失败交回上层。失败计数与重置由 SessionController 按
                             // "一次 attempt = 一次失败"统一处理：出站失败和"连上之后立刻 EOF"
                             // 是同一种后果（车机侧还挂着上一条链路），必须一起计数，
