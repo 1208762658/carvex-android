@@ -1357,8 +1357,27 @@ object Bootstrap {
                         " onCarSubnet="+onCarSubnet+" sameSubnetV4="+sameSubnetV4+
                         " ssidUnknown="+ssidUnknown+" ssid="+(current?:"<unknown>"))
                     val monitoring=java.util.concurrent.atomic.AtomicBoolean(true)
+                    // v106(20128)：复用租约监控补盲。7.4 ea2ab5b1：复用 lease 健康跑 3 分钟
+                    //（音频 7768 包/视频/HID 全绿），04:28:04 关联骤失——此前从复用到死亡
+                    // 之间零日志，三种死因（车机双频段 SSID 漫游 / 系统切走无互联网 Wi-Fi /
+                    // 车机 AP 重置）无法区分。补非 active 网络的 onAvailable/onLost 日志
+                    // 与 10s 节流链路快照；纯观测，不改变任何行为。
+                    val lastCapsLogMs=java.util.concurrent.atomic.AtomicLong(0)
                     val monitor=object:ConnectivityManager.NetworkCallback(){
-                        override fun onLost(network:Network){if(monitoring.get()&&!stopped.get()&&network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))}
+                        override fun onAvailable(network:Network){if(monitoring.get()&&!stopped.get()&&network!=active)log("Wi-Fi lease monitor: other network appeared net="+network+" active="+active+" (roam candidate)")}
+                        override fun onCapabilitiesChanged(network:Network,caps:NetworkCapabilities){
+                            if(!monitoring.get()||stopped.get()||network!=active)return
+                            val now=android.os.SystemClock.elapsedRealtime()
+                            val prev=lastCapsLogMs.get()
+                            if(now-prev<10_000||!lastCapsLogMs.compareAndSet(prev,now))return
+                            val wi=runCatching{caps.transportInfo as? android.net.wifi.WifiInfo}.getOrNull()
+                            log("Wi-Fi lease link: ssid="+(wi?.ssid?:"<unknown>")+" validated="+caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)+" internet="+caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
+                        }
+                        override fun onLost(network:Network){
+                            if(!monitoring.get()||stopped.get())return
+                            if(network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))
+                            else log("Wi-Fi lease monitor: non-active network lost net="+network)
+                        }
                     }
                     val request=NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                         .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
