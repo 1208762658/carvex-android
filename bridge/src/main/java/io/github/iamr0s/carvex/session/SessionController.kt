@@ -755,8 +755,15 @@ class SessionController(
             val bt=r.own(phase(Stage.BLUETOOTH,90000){runner.openBluetooth()})
             val pendingSourceEof=AtomicReference<Throwable?>(null)
             val sourceFailure=AtomicReference<(Throwable)->Unit>({error->
-                if(generateSequence(error){it.cause}.any{it is java.io.EOFException})pendingSourceEof.compareAndSet(null,error)
-                else failure(error)
+                // v107(20129)：AUTH 完成前的 EOF 不再静默暂存。暂存点 pendingSourceEof 只被
+                // AUTH 之后的 handoff 版 sourceFailure 消费，链路尚未同步时它永远无人取——
+                // attempt 在 link.start() 的 socket-closed 异常里无声终结：无 failure 日志、
+                // 无重试计数、无退避（7.6 实测 082d9535：Detect attempt=1 发出后 34ms 车机
+                // 拆链，attempt 静默死亡，重试循环未接管，20s 空窗直到外部重新拉起）。
+                // AUTH 前 EOF 与"连上之后立刻 EOF"是同一种后果（车机侧还挂着上一条链路），
+                // 按既有约定交 failure() 统一计数+退避重试；AUTH 后 handoff 语义由下面的
+                // sourceFailure.set 覆盖，本默认处理器不再被调用，暂存机制保持原样。
+                failure(error)
             })
             val link=r.own(IapLink(bt.inputStream,bt.outputStream,{BridgeStore.log(id,it)},{sourceFailure.get().invoke(it)}))
             phase(Stage.DETECT,25000){link.start(allowDirectSyn=true)}
