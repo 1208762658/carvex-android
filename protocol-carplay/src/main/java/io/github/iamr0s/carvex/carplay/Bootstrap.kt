@@ -438,68 +438,48 @@ object Bootstrap {
                                 round++
                                 log("RFCOMM window probe round=$round parallel channels=1..6"+
                                     " (car opens the window only after the driver taps CarPlay)")
-                                // v104(20126)：探测通道改为独立脱离作用域（SupervisorJob），
-                                // 赢家产生即放行。7.3 日志 b46509e9：ch4/ch5 的 connect() 各挂
-                                // 36.1s（6s killer 关 socket 关不掉内核态 connect），awaitAll 被
-                                // 拖满 36s——已选中的 ch3 健康通道进不了 iAP，整体 attempt 预算
-                                // 烧完当场终结（首连秒挂的管线级机制）。仓库惯用法参照本文件
-                                // persistent WiAP publication 的 SupervisorJob+IO 用法。
-                                val probeScope=kotlinx.coroutines.CoroutineScope(SupervisorJob()+Dispatchers.IO)
-                                val probes=(1..6).map{channel->probeScope.launch{
-                                    if(stopping.get()||winner.isCompleted)return@launch
-                                    val raw=rawRfcommSocket(device,channel)
-                                    if(raw==null){
-                                        log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
-                                        return@launch
-                                    }
-                                    r.own(raw);activeOutbound.set(raw)
-                                    val startedAt=android.os.SystemClock.elapsedRealtime()
-                                    log("RFCOMM raw channel=$channel attempt (SDP bypass)")
-                                    trace("tx","channel$channel","attempt","RAW_CHANNEL")
-                                    // connect() 自己不会超时；并发拨号时必须有看门狗把它的
-                                    // 5s 上限兜住，否则一轮又会被最慢的通道拖回 35s。
-                                    val killer=launch{delay(6_000);runCatching{raw.close()}}
-                                    try{
-                                        raw.connect()
-                                        killer.cancel()
-                                        activeOutbound.compareAndSet(raw,null)
-                                        if(stopping.get()||winnerSocket.get()!=null){
-                                            r.release(raw);return@launch
+                                coroutineScope{
+                                    (1..6).map{channel->async(Dispatchers.IO){
+                                        if(stopping.get()||winner.isCompleted)return@async
+                                        val raw=rawRfcommSocket(device,channel)
+                                        if(raw==null){
+                                            log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
+                                            return@async
                                         }
-                                        log("RFCOMM raw channel=$channel connected without SDP")
-                                        select(raw,"channel$channel")
-                                    }catch(t:Exception){
-                                        killer.cancel()
-                                        activeOutbound.compareAndSet(raw,null)
-                                        if(t is CancellationException)return@launch
-                                        if(winnerSocket.get()!==raw)r.release(raw)
-                                        val el=android.os.SystemClock.elapsedRealtime()-startedAt
-                                        log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
-                                        lastRaw=t
-                                    }
-                                }}
-                                // v104：赢家产生即放行——只等赢家，绝不等最慢的未决通道。
-                                // 未决探测在独立作用域里自生自灭（connect 由内核超时或 6s
-                                // killer 收尾，资源由 catch 分支释放），绝不阻塞已选中健康
-                                // 通道进入 iAP 的管线。
-                                while(!winner.isCompleted&&probes.any{it.isActive}&&
-                                    android.os.SystemClock.elapsedRealtime()<windowUntil)delay(50)
-                                if(winner.isCompleted)probes.forEach{runCatching{it.cancel()}}
+                                        r.own(raw);activeOutbound.set(raw)
+                                        val startedAt=android.os.SystemClock.elapsedRealtime()
+                                        log("RFCOMM raw channel=$channel attempt (SDP bypass)")
+                                        trace("tx","channel$channel","attempt","RAW_CHANNEL")
+                                        // connect() 自己不会超时；并发拨号时必须有看门狗把它的
+                                        // 5s 上限兜住，否则一轮又会被最慢的通道拖回 35s。
+                                        val killer=launch{delay(6_000);runCatching{raw.close()}}
+                                        try{
+                                            raw.connect()
+                                            killer.cancel()
+                                            activeOutbound.compareAndSet(raw,null)
+                                            if(stopping.get()||winnerSocket.get()!=null){
+                                                r.release(raw);return@async
+                                            }
+                                            log("RFCOMM raw channel=$channel connected without SDP")
+                                            select(raw,"channel$channel")
+                                        }catch(t:Exception){
+                                            killer.cancel()
+                                            activeOutbound.compareAndSet(raw,null)
+                                            if(t is CancellationException)throw t
+                                            if(winnerSocket.get()!==raw)r.release(raw)
+                                            val el=android.os.SystemClock.elapsedRealtime()-startedAt
+                                            log("RFCOMM raw channel=$channel failed: "+(t.message?:"")+" elapsedMs=$el")
+                                            lastRaw=t
+                                        }
+                                    }}.awaitAll()
+                                }
                                 last=lastRaw?:last
                                 if(stopping.get()||winner.isCompleted)break
                                 delay(400)
                             }
                         }
                         activeOutbound.set(null)
-                        // v105(20127)：失败上报只允许发生在"没有赢家"时。7.4 日志
-                        // 946610d8/c8947237/fd1d52e9：裸通道 ch3/ch2 已选中并进入 iAP
-                        //（Detect attempt=1 已发），但本行仍以 lastRaw 的 read ret:-1
-                        // 把 attempt 宣告为失败，SessionController 按"一次 attempt=一次
-                        // 失败"当场终结会话（选中后 ~1.3s attempt ended）。裸兜底路径
-                        // 自 v51 起从未真正交付过连接——v103 时代被 36s 人质掩盖成超时
-                        // 假象，v104 赢家即放行后暴露为 3.5s 速死。赢家在场时交由 iAP
-                        // 阶段自行定成败（其失败有独立计数路径）。
-                        if(isActive&&!stopping.get()&&winnerSocket.get()==null){
+                        if(isActive&&!stopping.get()){
                             // 这里只把失败交回上层。失败计数与重置由 SessionController 按
                             // "一次 attempt = 一次失败"统一处理：出站失败和"连上之后立刻 EOF"
                             // 是同一种后果（车机侧还挂着上一条链路），必须一起计数，
@@ -1357,27 +1337,8 @@ object Bootstrap {
                         " onCarSubnet="+onCarSubnet+" sameSubnetV4="+sameSubnetV4+
                         " ssidUnknown="+ssidUnknown+" ssid="+(current?:"<unknown>"))
                     val monitoring=java.util.concurrent.atomic.AtomicBoolean(true)
-                    // v106(20128)：复用租约监控补盲。7.4 ea2ab5b1：复用 lease 健康跑 3 分钟
-                    //（音频 7768 包/视频/HID 全绿），04:28:04 关联骤失——此前从复用到死亡
-                    // 之间零日志，三种死因（车机双频段 SSID 漫游 / 系统切走无互联网 Wi-Fi /
-                    // 车机 AP 重置）无法区分。补非 active 网络的 onAvailable/onLost 日志
-                    // 与 10s 节流链路快照；纯观测，不改变任何行为。
-                    val lastCapsLogMs=java.util.concurrent.atomic.AtomicLong(0)
                     val monitor=object:ConnectivityManager.NetworkCallback(){
-                        override fun onAvailable(network:Network){if(monitoring.get()&&!stopped.get()&&network!=active)log("Wi-Fi lease monitor: other network appeared net="+network+" active="+active+" (roam candidate)")}
-                        override fun onCapabilitiesChanged(network:Network,caps:NetworkCapabilities){
-                            if(!monitoring.get()||stopped.get()||network!=active)return
-                            val now=android.os.SystemClock.elapsedRealtime()
-                            val prev=lastCapsLogMs.get()
-                            if(now-prev<10_000||!lastCapsLogMs.compareAndSet(prev,now))return
-                            val wi=runCatching{caps.transportInfo as? android.net.wifi.WifiInfo}.getOrNull()
-                            log("Wi-Fi lease link: ssid="+(wi?.ssid?:"<unknown>")+" validated="+caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)+" internet="+caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
-                        }
-                        override fun onLost(network:Network){
-                            if(!monitoring.get()||stopped.get())return
-                            if(network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))
-                            else log("Wi-Fi lease monitor: non-active network lost net="+network)
-                        }
+                        override fun onLost(network:Network){if(monitoring.get()&&!stopped.get()&&network==active)onFailure(java.io.IOException("Reused Wi-Fi lease lost"))}
                     }
                     val request=NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                         .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()

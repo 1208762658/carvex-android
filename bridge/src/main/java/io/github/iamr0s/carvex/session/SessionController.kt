@@ -174,18 +174,6 @@ class SessionController(
                 }
             }
         }
-        // v110(20134) 纯观测：7.6/7.7 两份日志共 21 场 attempt，重试循环 catch(t:Exception)
-        // 一次都没进过（0 条 "failure:" 行），但 session 协程每次都静默死亡（wakelock
-        // released 正常打出 → 无 failure: → 无 retry backoff → ~7-10s 后进程消失、
-        // START_STICKY 重建）。显式取消路径（User disconnect/close/UI）已全部排除
-        // （0 条 "User disconnect"）。invokeOnCompletion 挂在循环 Job 上，无论终因是
-        // 取消、Error 还是逃逸异常，都留一行带 [LoopEnd] 特征的日志；纯观测不改任何
-        // 控制流，绝不抛出（铁律：宁可观测失效，不能二次崩溃）。
-        job?.invokeOnCompletion{cause->
-            runCatching{BridgeStore.log(BridgeStore.state.value.id,
-                "[LoopEnd] session loop terminated: "+(cause?.javaClass?.name?:"normally")+
-                ((cause?.message?.take(200))?.let{" msg=$it"}?:""))}
-        }
     }
     private suspend fun openLocalVideoContent(id:String,surface:Surface,width:Int,height:Int,fps:Int):LocalVideoContent? {
         val factory=localContent?:return null
