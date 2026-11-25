@@ -252,20 +252,6 @@ object BridgeStore {
     @Synchronized fun idle(){mutable.value=SessionState()}
     fun redact(s:String):String = s.replace(Regex("(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}"),"**:**:**:**:**:**")
         .replace(Regex("(?i)(password|psk|seed|secret|ssid|pairingPin|setupCode)\\s*[:=]\\s*[^,\\s]+"),"$1=<redacted>").take(500)
-    /** v108(20130)：crash 现场同步落盘。常规 log() 走 writer channel 异步写，进程崩溃时
-     *  队列尾部的行随进程消失（7.6 日志 68d1fff8 连 wakelock released 都没有，死因无法
-     *  归档）。这里绕过 channel 直接 appendText 到 diagnostic.log；整段 runCatching 兜底，
-     *  宁可取证失败，绝不因取证二次崩溃。SIGKILL/LMK 仍抓不到——本方法只回答"是否为
-     *  未捕获异常崩溃"。 */
-    @Synchronized fun crashLine(thread:Thread,throwable:Throwable){
-        runCatching{
-            val line=Instant.now().toString()+" [] [Crash] thread="+thread.name+
-                " cls="+throwable.javaClass.name+" msg="+(throwable.message?:"")+
-                " stack="+throwable.stackTraceToString().take(2000).replace("\n"," | ")
-            val f=File(context.filesDir,"diagnostic.log")
-            synchronized(logFileLock){f.appendText(line+"\n")}
-        }
-    }
     @Synchronized fun log(id:String,message:String){
         if(DiagnosticNoise.drop(message))return
         val line=Instant.now().toString()+" ["+id+"] "+redact(message)

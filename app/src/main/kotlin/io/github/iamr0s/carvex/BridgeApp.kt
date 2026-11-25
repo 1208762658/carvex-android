@@ -17,18 +17,6 @@ class BridgeApp:Application(),MixingServiceOwner{
     override fun onCreate(){
         super.onCreate()
         BridgeStore.init(this)
-        // v108(20130)：进程硬死取证。7.6 日志两场 attempt（68d1fff8/8457fde1）连 finally 都
-        // 没跑完就整进程消失，而全仓没有任何 UncaughtExceptionHandler——若死因是未捕获异常，
-        // 现场不留一字。这里装默认处理器：崩溃行经 BridgeStore.crashLine 同步落盘（绕过
-        // 异步 writer，崩溃时队列会丢尾），随后原样交回系统 handler，不改变崩溃流程本身。
-        // 纯观测补盲，不触碰任何连接主链路。
-        runCatching {
-            val previous=Thread.getDefaultUncaughtExceptionHandler()
-            Thread.setDefaultUncaughtExceptionHandler{t,e->
-                BridgeStore.crashLine(t,e)
-                previous?.uncaughtException(t,e)
-            }
-        }
         // 息屏场景的判定基线：进程是被 cw 拉起的还是系统重建的，此刻屏幕/Doze 处于什么状态，
         // 都在这行里。没有这行，息屏连不上时无法区分"没起来"和"起来了但被掐"。
         runCatching {
