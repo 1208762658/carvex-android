@@ -695,11 +695,27 @@ object Bootstrap {
          *  固件里 0x1D03/0xAA04 没有入站处理器；本实现把它们当终止通知，放行以保留快速失败。 */
         val unconditionalInbound=setOf(0x0000,0x0004,0x0005,0x1d01,0x1d03,0x1d05,0x1d06,
             0xaa01,0xaa03,0xaa04)
+        /**
+         * v114：866F 的"有线/宿主档" Identify —— 声明了 USB_HOST 组件，却一条无线交接
+         * 能力都没有。实车两档对比（20135 日志）：
+         *   fb61fd32 04:22:29 无线档：components=[BLUETOOTH,WIRELESS_CARPLAY]，
+         *       accessorySends=[0x5703,0xAA06]，receiverCanReceive 含 0x5702 → 进 WIFI 成功
+         *   b2589364 04:28:16 宿主档：components=[USB_HOST,BLUETOOTH,WIRELESS_CARPLAY]，
+         *       accessorySends=[0x4C00,0x4C02,0x4C03,0x4C05,0x4C07,0x4C08,0x5000,0x5002,
+         *       0x5003,0x6800,0x6802,0x6803]，无 5703/5702 → 旧代码干等 30s，用户必须再点一次
+         * 绿色图标。只有这一档才放宽入站闸与探路发送，其余对端保持"未声明即拒"的旧契约。
+         */
+        fun hostEnumeratedProfile():Boolean{
+            val identification=identified?:return false
+            return LinkTransport.USB in identification.capabilities.transportComponents &&
+                !identification.capabilities.networkHandoff.hasSupportedRoute
+        }
         fun inboundAllowed(id:Int):Boolean{
             if(id in unconditionalInbound)return true
             val state=transactions.context(LinkTransport.BT_RFCOMM,ConnectionDirection.OUTBOUND)
             if(state.identificationState!=IdentificationState.ACCEPTED)return false
             if(id==0xaa06)return id in accessorySends
+            if(id==0x5703&&hostEnumeratedProfile())return true
             return transactions.ready&&id in accessorySends
         }
         fun sendOptional(){
@@ -743,7 +759,21 @@ object Bootstrap {
             if(routes.carPlayStartSession){
                 send(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
             }
-            if(!routes.hasSupportedRoute)log("Identification accepted; no locally supported network handoff route declared")
+            if(!routes.hasSupportedRoute){
+                log("Identification accepted; no locally supported network handoff route declared")
+                // v114：866F 会按自己的 HMI 状态给两套 Identify profile ——
+                //   无线档：accessorySends 含 0x5703、receiverCanReceive 含 0x5702（fb61fd32 04:22:29）
+                //   有线/宿主档：accessorySends 是 4C0x/5000/680x，5703 与 5702 都不在（b2589364 04:28:16）
+                // 选中后者时旧代码只记一行、然后干等到超时，用户必须在车机上再点一次绿色图标。
+                // 补一次 0x5702（"请给出无线网络配置"）：同场日志 04:22:29.654 tx=0x5702 →
+                // .686 rx=0x5703 已证实这条请求/应答因果在 866F 上成立。车机若不认，按未声明
+                // 命令忽略，不留任何本地状态。
+                if(hostEnumeratedProfile()){
+                    log("[carvex.handoff] probe 0x5702 on host-enumerated profile (no 0x5703 in accessorySends)")
+                    runCatching{send(0x5702)}.onFailure{log("[carvex.handoff] 5702 probe failed: "+it.javaClass.simpleName)}
+                    announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
+                }
+            }
         }
         var evidence=PeerEvidence(version=PeerVersion(controlSession=control.version))
         var profile:IapPeerProfile=IapPeerProfiles.select(evidence)
@@ -1017,7 +1047,7 @@ object Bootstrap {
                             }
                         }
                     }
-                    0x5703->if(transactions.ready&&command.id in accessorySends){
+                    0x5703->if(transactions.ready&&(command.id in accessorySends||hostEnumeratedProfile())){
                         // Firmware accepts an empty 5703 body and still dispatches
                         // it to the platform. It is not a usable Wi-Fi snapshot,
                         // so keep it out of announcement-based endpoint selection.
@@ -1035,7 +1065,11 @@ object Bootstrap {
                             }
                             if(parsed!=null){
                                 announcement=parsed
-                                networkHandoff?.announcement(parsed)
+                                // 反射式兜底：handoff 上下文可能已被 resync 置为 retired，
+                                // 触碰它就是历史上那个 "context retired" 崩溃点。
+                                runCatching{networkHandoff?.announcement(parsed)}.onFailure{
+                                    log("[carvex.handoff] announcement store rejected ("+it.javaClass.simpleName+"); continuing on bootstrap snapshot")
+                                }
                                 runCatching{onWifiAnnouncement?.invoke(parsed)}.onFailure{
                                     log("5703 announcement platform callback failed ("+it.javaClass.simpleName+")")
                                 }
