@@ -205,12 +205,18 @@ object Bootstrap {
      * channel；866F 不回纯 SDP 查询，这一步失败就会在几十毫秒内抛 `read ret:-1`，
      * 表现成"车机拒绝连接"，其实是本地拿不到 channel。直接给 channel 就没有这个依赖。
      *
-     * 反射失败（隐藏 API 被策略拦截）时返回 null，由调用方跳过，不影响原有路径。
+     * 反射失败时返回 null，由调用方跳过，不影响原有路径。
+     *
+     * 20134 日志：d94a4c49 整场 6 通道 × 多轮全报"unavailable"，而同一天 b28e2163 的
+     * ch2/ch3 又能正常拨通——说明拦截是**按进程间歇**的（首次反射访问时的 hidden-API
+     * 判定被永久缓存到进程结束），不是恒定不可用。旧实现用 getOrNull() 把真实异常吞了，
+     * 日志只能猜"hidden API blocked"，无法区分 NoSuchMethodException（反射被拦）与
+     * IOException（适配器未就绪）。onError 把真实原因交回调用方，每场只报首条。
      */
-    private fun rawRfcommSocket(device:BluetoothDevice,channel:Int):BluetoothSocket?=runCatching{
+    private fun rawRfcommSocket(device:BluetoothDevice,channel:Int,onError:(Throwable)->Unit={}):BluetoothSocket?=runCatching{
         BluetoothDevice::class.java.getMethod("createRfcommSocket",Int::class.javaPrimitiveType)
             .invoke(device,channel) as BluetoothSocket
-    }.getOrNull()
+    }.getOrElse{onError(it);null}
 
     fun devices(context:Context):List<Device> {
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:return emptyList()
@@ -433,6 +439,16 @@ object Bootstrap {
                             val windowUntil=android.os.SystemClock.elapsedRealtime()+20_000L
                             var round=0
                             var lastRaw:Exception?=null
+                            // v111(20135)：赢家当选后必须立刻掐掉其余 in-flight 探测。
+                            // 20134 日志 bbfad119：ch3 在 12:13:08.636 就连上了，但 awaitAll 要等
+                            // 最慢那条通道被 6s killer 关掉，直到 12:13:13.053 才进 DETECT——4.4s 真空，
+                            // 进 DETECT 13ms 就 EOFException Truncated 0/2（车机早已把这条 RFCOMM 拆了）。
+                            // 同日志 phone 直连 3 场真空只有 2-3ms，全部顺利走到 AUTH/WIFI。
+                            // 这里保留 awaitAll 结构（v104 的独立 SupervisorJob + 赢家轮询改成过、
+                            // 7.7 里 21 场 0 条 failure 静默死，已回退），只把"等全部收尾"换成
+                            // "赢家一出现就关掉其余仍在拨号的 socket"，让它们的 connect 立刻失败返回。
+                            val inflight=java.util.concurrent.ConcurrentHashMap.newKeySet<BluetoothSocket>()
+                            val rawReflectCause=java.util.concurrent.atomic.AtomicReference<String?>(null)
                             while(!stopping.get()&&!winner.isCompleted&&
                                 android.os.SystemClock.elapsedRealtime()<windowUntil){
                                 round++
@@ -441,12 +457,16 @@ object Bootstrap {
                                 coroutineScope{
                                     (1..6).map{channel->async(Dispatchers.IO){
                                         if(stopping.get()||winner.isCompleted)return@async
-                                        val raw=rawRfcommSocket(device,channel)
+                                        val raw=rawRfcommSocket(device,channel){e->
+                                            // 每场只报首条：8 轮 × 6 通道会把同一个原因刷 48 条。
+                                            if(rawReflectCause.compareAndSet(null,e.javaClass.simpleName+" "+(e.message?:"(no message)")))
+                                                log("[carvex.raw] reflection failure cause (first): "+rawReflectCause.get())
+                                        }
                                         if(raw==null){
-                                            log("RFCOMM raw channel=$channel unavailable (hidden API blocked)")
+                                            log("RFCOMM raw channel=$channel unavailable (real cause in [carvex.raw]; the old 'hidden API blocked' wording was never confirmed)")
                                             return@async
                                         }
-                                        r.own(raw);activeOutbound.set(raw)
+                                        r.own(raw);activeOutbound.set(raw);inflight.add(raw)
                                         val startedAt=android.os.SystemClock.elapsedRealtime()
                                         log("RFCOMM raw channel=$channel attempt (SDP bypass)")
                                         trace("tx","channel$channel","attempt","RAW_CHANNEL")
@@ -456,14 +476,24 @@ object Bootstrap {
                                         try{
                                             raw.connect()
                                             killer.cancel()
+                                            inflight.remove(raw)
                                             activeOutbound.compareAndSet(raw,null)
                                             if(stopping.get()||winnerSocket.get()!=null){
                                                 r.release(raw);return@async
                                             }
                                             log("RFCOMM raw channel=$channel connected without SDP")
                                             select(raw,"channel$channel")
+                                            if(winnerSocket.get()===raw){
+                                                // 赢家已定：其余通道仍在 connect 阻塞，awaitAll 会把它们
+                                                // 等到 6s killer 到点，这段真空期正是车机拆链的窗口。
+                                                val aborted=inflight.size
+                                                inflight.forEach{other->if(other!==raw)runCatching{other.close()}}
+                                                inflight.clear()
+                                                log("[carvex.probe] channel=$channel won; aborted $aborted in-flight probes so DETECT starts now")
+                                            }
                                         }catch(t:Exception){
                                             killer.cancel()
+                                            inflight.remove(raw)
                                             activeOutbound.compareAndSet(raw,null)
                                             if(t is CancellationException)throw t
                                             if(winnerSocket.get()!==raw)r.release(raw)
