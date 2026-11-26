@@ -52,6 +52,12 @@ interface HostCallbacks {
     fun musicProgress(progress: Long) {}
     fun optionalAction(intent: Intent) {}
     fun musicSampleRate(): Int? = null
+
+    /**
+     * 车机端请求「跳转车机」—— 它要把前台显示收回自己的 Launcher，但会话必须继续。
+     * 返回 true 表示宿主已让位；false 表示不支持让位，会话层保持原样。
+     */
+    fun backToLauncher(): Boolean = false
     fun vehicleMicrophoneReady(): Boolean = false
 }
 

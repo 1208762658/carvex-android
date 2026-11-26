@@ -117,6 +117,9 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
     val encoderName:String get()=codec.name
     val hardwareAccelerated:Boolean get()=codec.codecInfo.isHardwareAccelerated
     @Volatile private var bitrateSupported=true
+    /** v113：只停画面帧投递，不拆 media 通道。车机点「跳转车机」时用来让出前台画面。 */
+    private val sendSuspended=AtomicBoolean(false)
+    private val suspendSkips=java.util.concurrent.atomic.AtomicLong(0)
     private var producer:Job?=null
     private var consumer:Job?=null
     private val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
@@ -185,6 +188,8 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
     private fun canRepeat()=front!=null||repeatFrame!=null
     /** Resubmits the current picture through whichever path owns it. */
     private fun repeatPicture(){
+        // 让位期间不再主动重发静止画面：重发正是车机一直有画面可显示的原因。
+        if(sendSuspended.get())return
         val frontSurface=front
         if(frontSurface!=null)frontSurface.repeat() else repeatFrame?.invoke()
     }
@@ -234,6 +239,9 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
             try {
                 for(packet in queue){
                     if(packet.generation!=refreshGeneration.get()){diagnostic("dropped",1);continue}
+                    // v113：让位期间画面帧在这里丢弃，config 包继续发，媒体通道与协商结果
+                    // 全部保持。丢弃计数留给 resume 时一行汇报，不逐帧刷日志。
+                    if(!packet.config&&sendSuspended.get()){suspendSkips.incrementAndGet();continue}
                     if(generation!=packet.generation){delivery.reset();generation=packet.generation}
                     val age=(System.nanoTime()-packet.queuedAt)/1_000_000
                     diagnostic("queue-ms",age)
@@ -357,6 +365,23 @@ class VideoEncoder(val width:Int,val height:Int,fps:Int,bitrate:Int,hostFormat:B
         synchronized(rateLock){pendingBitrate.set(ratePolicy.configure(value))}
         return true
     }
+    /**
+     * v113：车机端「跳转车机」= 它要把前台显示拿回自己的 Launcher。我们既不 teardown、
+     * 也不 closeVideo（那会连带结束 media 通道，等于断开），只把画面帧停止投递：
+     * 车机不再有新画面可显示，会话、音频、iAP2 全部原样保留。
+     * 恢复时必须 requestIdr()：丢弃期间接收端的参考帧链已断，只发 P 帧无法解码。
+     */
+    fun suspendSend(value:Boolean):Boolean {
+        if(closed.get()||!producing.get())return false
+        if(sendSuspended.getAndSet(value)==value)return true
+        // 恢复必须走一次 IDR：让位期间丢弃的画面帧已经断了接收端参考链。
+        if(!value)requestIdr()
+        return true
+    }
+    fun isSendSuspended():Boolean=sendSuspended.get()
+    /** 本次让位累计丢弃的画面帧数，供调用方在 resume 时汇报（VideoEncoder 自身不刷日志）。 */
+    fun takeSuspendSkips():Long=suspendSkips.getAndSet(0)
+
     fun requestIdr():Boolean {
         if(closed.get()||!producing.get())return false
         synchronized(refreshLock){

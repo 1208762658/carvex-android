@@ -261,18 +261,15 @@ class SessionController(
         var downTime=0L
         var lastX=0f
         var lastY=0f
-        // v112(20136)：车机"返回车机"按钮的失效根因与判据。
-        // 20135 实车日志（fb61fd32 最后一分钟）里用户连点 40+ 次，车机**没有发过一条 iAP2
-        // 下行命令**（该区间 direction=rx 0 条），全部是 5 字节原样触摸报告，down/up 成对，
-        // 且 40 次落点几乎重合。也就是说车机把这个按钮当成"CarPlay 画面触摸"透传给我们，
-        // 它自己的退出逻辑从此不再触发 → 只要我们不停，它就停在 CarPlay 界面。
-        // 判据不写死像素热区：descriptor 的 min/max 未知，TouchSample 的像素坐标不可跨设备
-        // 复用（连续 3 次同点也算，阈值 4 次是为了避开正常双击）。命中即以既有 disconnect
-        // 路径收尾，车机检测到 accessory 断开后自然掉回原生界面。
-        var sameSpotTaps=0
-        var sameSpotAt=0L
-        var sameSpotX=0f
-        var sameSpotY=0f
+        // v113(20137)：车机"跳转车机"按钮的真实通路与状态。
+        // 20135 日志（fb61fd32）证明该按钮**不是**触摸透传失败：用户 04:27:04–04:28:08 每次
+        // 点击，车机端都紧接着调到 host-action:carlife_back_to_car_launcher（31 次，间隔与
+        // 手指点击一一对应），同时把 fps 请求在 30（后台）与 60（前台）之间来回拨。旧代码只
+        // 记一行日志、返回 null、画面照旧满帧推送 → 车机拿不回前台，只能反复请求。
+        // 修法是让位而不断开：停画面帧、保留 media 通道与 iAP2/音频，等同于 iPhone 的 CarPlay
+        // 挂后台。恢复信号用 fps≥60（车机把前台还给我们）与下一次画面触摸双保险。
+        val backToLauncherAt=java.util.concurrent.atomic.AtomicLong(0)
+        val videoSuspended=java.util.concurrent.atomic.AtomicBoolean(false)
         val keyLock=Any()
         val musicLock=Any()
         val latestMusic=AtomicReference<NowPlayingUpdate.Track?>(null)
@@ -337,6 +334,28 @@ class SessionController(
         var keysClosed=false
         val pendingHostFps=AtomicInteger(0)
         var video:VideoEncoder?=null
+        /**
+         * v113：车机点「跳转车机」时让出前台画面。
+         * 只停画面帧投递：不 teardown screen、不 closeVideo、不 disconnect —— media 通道协商
+         * 结果、音频、iAP2 全部保持，这就是"CarPlay 挂后台而会话不断"。
+         */
+        fun suspendVideo(reason:String):Boolean{
+            if(videoSuspended.getAndSet(true))return true
+            backToLauncherAt.set(SystemClock.elapsedRealtime())
+            val applied=runCatching{video?.suspendSend(true)==true}.getOrDefault(false)
+            BridgeStore.log(id,"[carvex.backto] suspend video send reason="+reason+" applied="+applied+
+                "; media channel, audio and iAP2 untouched")
+            return applied
+        }
+        fun resumeVideo(reason:String):Boolean{
+            if(!videoSuspended.getAndSet(false))return true
+            val encoder=video
+            val skipped=runCatching{encoder?.takeSuspendSkips()}.getOrDefault(0L)
+            val applied=runCatching{encoder?.suspendSend(false)==true}.getOrDefault(false)
+            BridgeStore.log(id,"[carvex.backto] resume video send reason="+reason+" applied="+applied+
+                " droppedFrames="+skipped+"; an IDR was requested to rebuild the reference chain")
+            return applied
+        }
         val h=r.own(hostFactory(context,object:HostCallbacks {
             override fun event(name:String,value:Int){
                 if(ended.get())return
@@ -514,10 +533,16 @@ class SessionController(
                         " carInput="+carInput+" inputReady="+inputReady+" -> "+ready)}
                 return ready
             }
+            override fun backToLauncher():Boolean{
+                if(ended.get())return false
+                return suspendVideo("host-carlife_back_to_car_launcher")
+            }
             override fun fps(value:Int){
                 if(!ended.get()){
                     if(value<=0){BridgeStore.log(id,"${"Invalid host FPS request ignored: "}${value}");return}
                     BridgeStore.log(id,"${"Dynamic FPS requested="}${value}")
+                    // v113：车机把前台帧率拨回 60 = 它已回到投屏界面，让位结束。
+                    if(value>=60)resumeVideo("host-fps-"+value)
                     pendingHostFps.set(value)
                     applyDynamicFps?.invoke(value)
                 }
@@ -724,21 +749,9 @@ class SessionController(
                 val mapped=projectionGeometry.get()?.map(sample)?:return@synchronized false
                 val now=SystemClock.uptimeMillis()
                 val action=when{sample.pressed&&!pressed->{downTime=now;MotionEvent.ACTION_DOWN};sample.pressed->MotionEvent.ACTION_MOVE;pressed->MotionEvent.ACTION_UP;else->return@synchronized true}
-                if(action==MotionEvent.ACTION_DOWN){
-                    // "同一个点被反复戳"才是判据：按钮没反应时用户会连点，正常使用很少对同一点
-                    // 连点 4 次。容差取宿主屏宽 3%（1354 屏约 40px），窗口 1.5s。
-                    val tol=(projectionGeometry.get()?.width?:1354).toFloat()*0.03f
-                    val repeat=sameSpotTaps>0&&now-sameSpotAt<=1_500L&&
-                        kotlin.math.abs(mapped.x-sameSpotX)<=tol&&kotlin.math.abs(mapped.y-sameSpotY)<=tol
-                    sameSpotTaps=if(repeat)sameSpotTaps+1 else 1
-                    sameSpotAt=now;sameSpotX=mapped.x;sameSpotY=mapped.y
-                    if(sameSpotTaps>=4&&!ended.get()){
-                        sameSpotTaps=0
-                        BridgeStore.log(id,"[carvex.exit] car-side return gesture: 4 taps on the same spot (x="+
-                            mapped.x.toInt()+" y="+mapped.y.toInt()+", tol="+tol.toInt()+
-                            "); ending the session so the head unit can drop the CarPlay screen")
-                        scope.launch(Dispatchers.IO){runCatching{disconnect()}}
-                    }
+                if(action==MotionEvent.ACTION_DOWN&&videoSuspended.get()&&!ended.get()){
+                    // 让位后又出现了画面触摸 = 车机已把前台还给投屏，立刻恢复出图。
+                    resumeVideo("touch")
                 }
                 pressed=sample.pressed;lastX=mapped.x;lastY=mapped.y
                 val event=MotionEvent.obtain(downTime,now,action,mapped.x,mapped.y,0).apply{source=InputDevice.SOURCE_TOUCHSCREEN}

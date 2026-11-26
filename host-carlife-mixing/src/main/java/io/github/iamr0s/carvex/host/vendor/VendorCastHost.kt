@@ -152,6 +152,16 @@ class VendorCastHost(
                 "carlife_vr_use_phone_mic" -> Bundle().apply {
                     putBoolean("is_use_phone_mic", !(microphone != null && events.vehicleMicrophoneReady()))
                 }
+                // v113：车机点「跳转车机」的车机端请求（20135 日志 31 次全被只记日志吞掉）。
+                // 语义是把前台显示还回车机 Launcher，不是断开；会话层负责让出画面。
+                "carlife_back_to_car_launcher" -> {
+                    val accepted = runCatching { events.backToLauncher() }.getOrDefault(false)
+                    events.event("host-action:carlife_back_to_car_launcher", if (accepted) 1 else 0)
+                    Bundle().apply {
+                        putInt("result", if (accepted) 0 else -1)
+                        putBoolean("success", accepted)
+                    }
+                }
                 "carlife_music_sample_rate" -> events.musicSampleRate()
                     ?.takeIf { it in 8000..192000 }
                     ?.let { Bundle().apply { putInt("music_sample_rate", it) } }
